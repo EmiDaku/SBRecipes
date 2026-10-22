@@ -1,0 +1,6 @@
+# Build and distribution directories
+dist/
+build/
+
+# SkyBlock Tracker spec file
+skyblocktracker.spec
