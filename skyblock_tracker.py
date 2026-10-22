@@ -27,10 +27,18 @@ Requires Python 3.9+ and Tkinter. No third-party packages are required.
 
 from __future__ import annotations
 
+import base64
+import gzip
+import os
+import struct
+import hashlib
 import json
 import sys
 import threading
+import time
+import urllib.error
 import urllib.request
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 import tkinter as tk
@@ -83,7 +91,11 @@ MUTED = "#8593aa"
 ACCENT = "#4c8dff"
 ACCENT_HOVER = "#3b7bf0"
 ACCENT_PRESSED = "#2f66cf"
-SELECT_BG = "#1b3558"
+SELECT_BG = "#29456b"
+TREE_ALT_BG = "#182331"          # quiet stripes to help follow long recipe branches
+TREE_DONE_BG = "#195138"         # full-width completion highlight
+TREE_DONE_SELECTED_BG = "#26734e" # selected rows stay green
+TREE_DONE_FG = "#e1ffed"
 GREEN = "#4ade80"
 AMBER = "#fbbf24"
 RED = "#f87171"
@@ -226,6 +238,698 @@ def draw_logo(canvas, size) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Item rarity colours
+# ---------------------------------------------------------------------------
+# Close to the in-game colours, with the darker ones (blue / purple) lightened
+# a little so they stay readable on the dark theme.
+RARITY_COLORS = {
+    "COMMON": "#ffffff",
+    "UNCOMMON": "#55ff55",
+    "RARE": "#6f8dff",
+    "EPIC": "#b65cff",
+    "LEGENDARY": "#ffaa00",
+    "MYTHIC": "#ff55ff",
+    "DIVINE": "#55ffff",
+    "SPECIAL": "#ff5555",
+    "VERY_SPECIAL": "#ff4444",
+    "ULTIMATE": "#ff4444",
+    "ADMIN": "#ff4444",
+    "UNOBTAINABLE": "#ff5555",
+    "UNKNOWN": TEXT,
+}
+
+
+def blend(foreground: str, background: str, weight: float) -> str:
+    """Mix two #rrggbb colours; `weight` is how much of `foreground` to keep."""
+    f = [int(foreground[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(background[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(f[k] * weight + b[k] * (1 - weight)) for k in range(3))
+
+
+def configure_rarity_tags(tree) -> None:
+    """Row-wide state colors: rarity when needed, green when completed.
+
+    A selected completed item remains green instead of being painted blue.
+    The normal Treeview selection state is overridden below by our per-row tags.
+    """
+    for tier, color in RARITY_COLORS.items():
+        tree.tag_configure(f"rar_{tier}", foreground=color, background=SURFACE)
+        tree.tag_configure(f"rar_{tier}_alt", foreground=color, background=TREE_ALT_BG)
+        tree.tag_configure(f"rar_{tier}_selected", foreground=TEXT_STRONG, background=SELECT_BG)
+        tree.tag_configure(
+            f"rar_{tier}_done", foreground=TREE_DONE_FG, background=TREE_DONE_BG,
+            font=(FONT, 10, "bold"),
+        )
+        tree.tag_configure(
+            f"rar_{tier}_done_selected", foreground="#ffffff", background=TREE_DONE_SELECTED_BG,
+            font=(FONT, 10, "bold"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Item icons: FurfSky Reborn first, vanilla Minecraft textures as a fallback
+# ---------------------------------------------------------------------------
+class IconStore:
+    """Finds a small icon for every item and caches it on disk.
+
+    1. FurfSky Reborn: download the release ZIP, unpack its Catharsis CATS
+       container (if present), and resolve SkyBlock item definitions/models.
+       Downloads are re-checked about once a week.
+    2. Vanilla Minecraft (1.8.8) textures, looked up from the item's material
+       as reported by the Hypixel API, downloaded one file at a time.
+    3. A neutral placeholder square if neither has the item.
+
+    Nothing here blocks the window: downloads run on one background thread and
+    `on_change` is called when new icons are ready.
+    """
+
+    API_URL = "https://api.github.com/repos/furfsky/reborn/releases/latest"
+    VANILLA_URL = "https://raw.githubusercontent.com/rom1504/minecraft-assets/master/data/1.8.8/{}.png"
+    USER_AGENT = "SkyBlock-Crafting-Tree-Tracker/2.0"
+    RECHECK_SECONDS = 7 * 24 * 3600
+    SKIP_PATHS = (
+        "/gui/", "/entity/", "/environment/", "/particle/", "/font/", "/colormap/",
+        "/painting/", "/mob_effect/", "/models/", "/misc/", "/map/", "/trims/", "/armor/",
+    )
+    # Legacy material names whose 1.8.8 texture file is named differently.
+    VANILLA_ALIASES = {
+        "REDSTONE": "redstone_dust", "SULPHUR": "gunpowder", "NETHER_STALK": "nether_wart",
+        "CARROT_ITEM": "carrot", "POTATO_ITEM": "potato", "RAW_FISH": "fish_cod_raw",
+        "COOKED_FISH": "fish_cod_cooked", "SEEDS": "seeds_wheat", "SNOW_BALL": "snowball",
+        "EYE_OF_ENDER": "ender_eye", "EXP_BOTTLE": "experience_bottle", "FIREBALL": "fireball",
+        "BOOK_AND_QUILL": "book_writable", "MELON": "melon", "GOLD_RECORD": "record_13",
+    }
+    # Materials whose look depends on damage values / NBT we do not have.
+    VANILLA_SKIP = {"SKULL_ITEM", "INK_SACK", "MONSTER_EGG", "POTION", "BANNER", "WOOL", "LOG", "LOG_2", "LEAVES"}
+
+    def __init__(self, root, cache_dir, material_of, on_change, on_note):
+        self.root = root
+        self.dir = Path(cache_dir)
+        self.material_of = material_of
+        self.on_change = on_change
+        self.on_note = on_note
+        self._lock = threading.Lock()
+        self._zips = []
+        self._index = {}
+        self._index_done = False
+        self._member_cache = {}
+        self._models = {}
+        self._model_by_stem = {}
+        self._definitions = {}
+        self._all_pngs = {}
+        self._resolved = {}
+        self._digest_users = {}
+        self._bad_digests = set()
+        self._keepalive = []
+        self._report_info = []
+        self._bytes = {}
+        self._photos = {}
+        self._placeholders = {}
+        self._bad = set()
+        self._missing = set()
+        self._queue = []
+        self._queued = set()
+        self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    # ---------------------------- public ---------------------------------
+
+    def get(self, item_id, big=False, network=True):
+        """Return a PhotoImage right now (a placeholder until the real one is ready)."""
+        key = (item_id, big)
+        photo = self._photos.get(key)
+        if photo is not None:
+            return photo
+        data = self._lookup(item_id)
+        if data:
+            photo = self._make_photo(data, big)
+            if photo is not None:
+                self._photos[key] = photo
+                return photo
+            self._bad.add(item_id)
+            self._bytes.pop(item_id, None)
+        elif network and self._index_done and item_id not in self._missing:
+            self._enqueue(item_id)
+        elif network and not self._index_done:
+            self._enqueue(item_id)
+        return self._placeholder(big)
+
+    # --------------------------- lookups ----------------------------------
+
+    def _lookup(self, item_id):
+        if item_id in self._bytes:
+            return self._bytes[item_id]
+        if not self._index_done:
+            return None
+        data = self._from_furfsky(item_id)
+        if data is not None:
+            data = self._check_shared(item_id, data)
+        if data is None:
+            data = self._from_vanilla_disk(item_id)
+        if data is not None:
+            self._bytes[item_id] = data
+        return data
+
+    def _check_shared(self, item_id, data):
+        """Accept explicitly mapped textures even when several IDs share a sprite.
+
+        Shared PNG bytes are common for legitimate item variants. Formerly the
+        fourth use of a texture invalidated earlier icons and could leave the
+        interface showing generic placeholders. A PAPER material is now handled
+        by _vanilla_candidates instead of by rejecting shared pack images.
+        """
+        return data
+
+    def _furfsky_ok(self, item_id):
+        data = self._from_furfsky(item_id)
+        return data is not None and hashlib.md5(data).hexdigest() not in self._bad_digests
+
+    def _from_furfsky(self, item_id):
+        if item_id in self._bad:
+            return None
+        entry, how = self._resolve_member(item_id.lower())
+        if entry is None:
+            return None
+        self._resolved[item_id] = (how, entry[1])
+        return self._read(entry)
+
+    def _read(self, entry):
+        number, member = entry
+        try:
+            with self._lock:
+                return self._zips[number].read(member)
+        except (KeyError, OSError, IndexError, zipfile.BadZipFile):
+            return None
+
+    def _read_json(self, entry):
+        raw = self._read(entry)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8-sig"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+
+    def _resolve_member(self, stem):
+        """Find the pack texture for a SkyBlock ID: follow the pack's own model
+        files first, then fall back to a texture file with the same name."""
+        if stem in self._member_cache:
+            return self._member_cache[stem]
+        result = (None, "")
+        try:
+            entry = self._from_models(stem)
+            if entry is not None:
+                result = (entry, "model")
+            elif stem in self._index:
+                result = (self._index[stem], "name")
+            elif "_" in stem:
+                matches = [key for key in self._index if key.endswith("_" + stem)]
+                if matches:
+                    result = (self._index[min(matches, key=len)], "suffix")
+        except Exception:
+            result = (None, "")
+        self._member_cache[stem] = result
+        return result
+
+    def _from_models(self, stem):
+        references = []
+        for entry in self._definitions.get(stem, []):
+            references.extend(self._definition_models(entry))
+        references.extend(self._model_by_stem.get(stem, []))
+        for reference in references:
+            texture = self._texture_of_model(reference, 0)
+            if texture is not None:
+                return texture
+        return None
+
+    def _definition_models(self, entry):
+        """Model references listed in a 1.21.4+ item definition (assets/<ns>/items/<id>.json)."""
+        data = self._read_json(entry)
+        found = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "model" and isinstance(value, str):
+                        found.append(value.lower())
+                    else:
+                        walk(value)
+            elif isinstance(node, list):
+                for value in node:
+                    walk(value)
+
+        walk(data)
+        return found
+
+    def _texture_of_model(self, reference, depth):
+        if depth > 4:
+            return None
+        reference = reference if ":" in reference else "minecraft:" + reference
+        entry = self._models.get(reference)
+        if entry is None:
+            return None
+        data = self._read_json(entry)
+        if not isinstance(data, dict):
+            return None
+        textures = data.get("textures")
+        if isinstance(textures, dict):
+            choices = [textures.get("layer0")] + [v for k, v in textures.items() if k != "particle"]
+            for value in choices:
+                if not isinstance(value, str) or value.startswith("#"):
+                    continue
+                value = value.lower()
+                namespace, _sep, path = (value if ":" in value else "minecraft:" + value).partition(":")
+                if namespace == "minecraft" and path in (
+                    "item/paper", "item/air", "item/barrier", "item/empty",
+                    "item/stick", "item/name_tag", "item/map"):
+                    continue  # generic base textures are not custom SkyBlock icons
+                texture = self._all_pngs.get(f"{namespace}/{path}")
+                if texture is not None:
+                    return texture
+        parent = data.get("parent")
+        if isinstance(parent, str) and ":" in parent and not parent.lower().startswith("minecraft:"):
+            return self._texture_of_model(parent.lower(), depth + 1)
+        return None
+
+    def _vanilla_candidates(self, item_id):
+        material = str(self.material_of(item_id) or "").upper()
+        if not material or material in self.VANILLA_SKIP:
+            return []
+        # Many SkyBlock items are PAPER underneath. Showing the vanilla paper
+        # sprite for every such custom item is more misleading than no icon.
+        if material == "PAPER" and item_id.upper() != "PAPER":
+            return []
+        name = self.VANILLA_ALIASES.get(material, material.lower())
+        return [f"items/{name}", f"blocks/{name}"]
+
+    def _vanilla_path(self, relative):
+        return self.dir / "vanilla" / (relative.replace("/", "_") + ".png")
+
+    def _from_vanilla_disk(self, item_id):
+        for relative in self._vanilla_candidates(item_id):
+            path = self._vanilla_path(relative)
+            if path.exists():
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    pass
+        return None
+
+    # ------------------------- background worker --------------------------
+
+    def _enqueue(self, item_id):
+        with self._lock:
+            if item_id in self._queued:
+                return
+            self._queued.add(item_id)
+            self._queue.append(item_id)
+            if self._running:
+                return
+            self._running = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        if not self._index_done:
+            try:
+                self._load_index()
+            except Exception:
+                self._note("unavailable — check your internet connection")
+            self._index_done = True
+            self._notify()
+        fetched = 0
+        while True:
+            with self._lock:
+                if not self._queue:
+                    self._running = False
+                    break
+                item_id = self._queue.pop(0)
+            found = False
+            try:
+                if not self._furfsky_ok(item_id):
+                    found = self._fetch_vanilla(item_id)
+                else:
+                    found = True  # the window picks it up from the pack on its next refresh
+            except Exception:
+                found = False
+            with self._lock:
+                self._queued.discard(item_id)
+            if not found:
+                self._missing.add(item_id)
+            fetched += 1
+            if found and fetched % 6 == 0:
+                self._notify()
+        self._write_report()
+        self._notify()
+
+    def _fetch_vanilla(self, item_id):
+        for relative in self._vanilla_candidates(item_id):
+            path = self._vanilla_path(relative)
+            marker = path.with_suffix(".missing")
+            if path.exists():
+                self._bytes[item_id] = path.read_bytes()
+                return True
+            if marker.exists():
+                continue
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                request = urllib.request.Request(self.VANILLA_URL.format(relative), headers={"User-Agent": self.USER_AGENT})
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    data = response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    try:
+                        marker.write_bytes(b"")
+                    except OSError:
+                        pass
+                continue
+            except Exception:
+                continue
+            if data[:8] != b"\x89PNG\r\n\x1a\n":
+                continue
+            try:
+                path.write_bytes(data)
+            except OSError:
+                pass
+            self._bytes[item_id] = data
+            return True
+        return False
+
+    # ---------------------------- FurfSky pack ----------------------------
+
+    def _load_index(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        meta_path = self.dir / "furfsky_meta.json"
+        meta = load_json(meta_path, {})
+        zips = self._cached_zips()
+        stale = (time.time() - float(meta.get("checked", 0) or 0)) > self.RECHECK_SECONDS
+        if not zips or stale:
+            if not zips:
+                self._note("downloading FurfSky Reborn (one-time)…")
+            try:
+                self._download_furfsky(meta_path, meta)
+            except Exception:
+                pass
+            zips = self._cached_zips()
+        self._build_index(zips)
+        if self._index:
+            self._note("FurfSky Reborn")
+        else:
+            self._note("Minecraft textures only (FurfSky download unavailable)")
+
+    def _cached_zips(self):
+        files = list(self.dir.glob("furfsky_*.zip"))
+        return sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+
+    def _download_furfsky(self, meta_path, meta):
+        request = urllib.request.Request(
+            self.API_URL, headers={"User-Agent": self.USER_AGENT, "Accept": "application/vnd.github+json"}
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            release = json.loads(response.read().decode("utf-8"))
+        tag = str(release.get("tag_name", ""))
+        existing = self._cached_zips()
+        if existing and meta.get("tag") == tag:
+            save_json(meta_path, {"tag": tag, "checked": time.time()})
+            return
+        assets = [
+            a for a in release.get("assets", [])
+            if str(a.get("name", "")).lower().endswith(".zip") and a.get("browser_download_url")
+        ]
+        downloaded = []
+        for number, asset in enumerate(assets[:4]):
+            if int(asset.get("size", 0) or 0) > 80_000_000:
+                continue
+            destination = self.dir / f"furfsky_{number}.zip"
+            partial = destination.with_suffix(".part")
+            request = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": self.USER_AGENT})
+            with urllib.request.urlopen(request, timeout=60) as response, partial.open("wb") as out:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            downloaded.append((partial, destination))
+        if not downloaded:
+            return
+        for old in existing:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        for partial, destination in downloaded:
+            partial.replace(destination)
+        save_json(meta_path, {"tag": tag, "checked": time.time()})
+
+    def _decode_cats(self, packed, output):
+        """Convert a Catharsis CATS blob into entries in a normal ZIP archive.
+
+        CATS stores a directory tree followed by file data at offsets relative
+        to the end of that tree. Entries may be raw (0xff) or gzip (0xfe).
+        Only model/item JSON and PNGs are needed for icons.
+        """
+        position = 0
+
+        def consume(length):
+            nonlocal position
+            if length < 0 or position + length > len(packed):
+                raise ValueError("Truncated Catharsis directory")
+            data = packed[position:position + length]
+            position += length
+            return data
+
+        def number(fmt):
+            return struct.unpack(fmt, consume(struct.calcsize(fmt)))[0]
+
+        if consume(4) != b"CATS":
+            raise ValueError("File is not a Catharsis CATS archive")
+        version = number(">B")
+        entries = []
+
+        def walk(prefix, depth=0):
+            if depth > 30:
+                raise ValueError("Catharsis directory is too deep")
+            count = number(">H")
+            for _ in range(count):
+                kind = number(">B")
+                name = consume(number(">B")).decode("ascii", "replace")
+                path = f"{prefix}{name}"
+                if kind == 1:
+                    walk(path + "/", depth + 1)
+                elif kind == 0:
+                    offset = number(">i")
+                    size = number(">i")
+                    compression = number(">B")
+                    entries.append((path, offset, size, compression))
+                    if len(entries) > 100000:
+                        raise ValueError("Too many Catharsis entries")
+                else:
+                    raise ValueError(f"Unknown Catharsis entry type: {kind}")
+
+        walk("")
+        data_start = position
+        exported = 0
+        for path, offset, size, compression in entries:
+            name = path.replace("\\", "/").lstrip("/")
+            lower = name.lower()
+            if ("/assets/" not in "/" + lower or
+                    not lower.endswith((".png", ".json")) or
+                    ".." in name.split("/")):
+                continue
+            if offset < 0 or size < 0 or size > 30_000_000:
+                continue
+            first, last = data_start + offset, data_start + offset + size
+            if last > len(packed):
+                continue
+            blob = packed[first:last]
+            try:
+                if compression == 0xfe:
+                    blob = gzip.decompress(blob)
+                elif compression != 0xff:
+                    continue
+            except (OSError, EOFError):
+                continue
+            if len(blob) > 30_000_000:
+                continue
+            output.writestr(name, blob)
+            exported += 1
+        return version, len(entries), exported
+
+    def _expanded_zip(self, source):
+        """Return a ZIP the ordinary indexer can read, decoding CATS if needed.
+
+        Cache is a different filename so _cached_zips() never mistakes the
+        generated index archive for a new GitHub release asset.
+        """
+        with zipfile.ZipFile(source) as archive:
+            containers = [name for name in archive.namelist()
+                          if name.lower().endswith(".cats")]
+            if not containers:
+                return source
+            expanded = self.dir / f"expanded_{source.stem}.zip"
+            if expanded.exists() and expanded.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+                if zipfile.is_zipfile(expanded):
+                    self._cat_notes.append(f"using decoded CATS cache: {expanded.name}")
+                    return expanded
+            partial = expanded.with_suffix(".tmp")
+            try:
+                total = 0
+                descriptions = []
+                with zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_STORED,
+                                     allowZip64=True) as out:
+                    for filename in containers:
+                        version, entries, exported = self._decode_cats(
+                            archive.read(filename), out)
+                        total += exported
+                        descriptions.append(f"{filename}: v{version}, {entries} files, {exported} assets")
+                if total == 0:
+                    raise ValueError("Catharsis pack contained no indexable assets")
+                os.replace(partial, expanded)
+                self._cat_notes.extend(descriptions)
+                return expanded
+            finally:
+                if partial.exists():
+                    partial.unlink()
+
+    def _build_index(self, zip_paths):
+        main, vanilla_ns = {}, {}
+        ranks = {id(main): {}, id(vanilla_ns): {}}
+        models, model_by_stem, definitions, all_pngs = {}, {}, {}, {}
+        namespaces = {}
+        zips = []
+        self._cat_notes = []
+
+        def put(target, stem, entry, rank):
+            known = ranks[id(target)]
+            if stem not in target or rank < known[stem]:
+                target[stem] = entry
+                known[stem] = rank
+
+        for path in zip_paths:
+            try:
+                index_path = self._expanded_zip(path)
+                archive = zipfile.ZipFile(index_path)
+                names = archive.namelist()
+            except (OSError, ValueError, zipfile.BadZipFile, EOFError) as error:
+                self._cat_notes.append(f"failed to index {path.name}: {error}")
+                continue
+            number = len(zips)
+            zips.append(archive)
+            for member in names:
+                lower = member.lower()
+                cut = lower.find("assets/")
+                if cut < 0:
+                    continue
+                parts = lower[cut + 7:].split("/")
+                if len(parts) < 3:
+                    continue
+                namespace, rest = parts[0], "/".join(parts[1:])
+                base = rest.rsplit("/", 1)[-1]
+                if lower.endswith(".json"):
+                    if rest.startswith("models/"):
+                        key = f"{namespace}:{rest[7:-5]}"
+                        models[key] = (number, member)
+                        if namespace != "minecraft":
+                            model_by_stem.setdefault(base[:-5], []).append(key)
+                    elif rest.startswith("items/") and namespace != "minecraft":
+                        definitions.setdefault(base[:-5], []).append((number, member))
+                    continue
+                if not lower.endswith(".png") or not rest.startswith("textures/"):
+                    continue
+                all_pngs[f"{namespace}/{rest[9:-4]}"] = (number, member)
+                namespaces[namespace] = namespaces.get(namespace, 0) + 1
+                if any(part in "/" + rest for part in self.SKIP_PATHS):
+                    continue
+                stem = base[:-4]
+                if not stem or stem.startswith("_"):
+                    continue
+                rank = 0 if ("/item/" in "/" + rest or "/items/" in "/" + rest) else 1
+                put(vanilla_ns if namespace == "minecraft" else main, stem, (number, member), rank)
+
+        self._zips = zips
+        # SkyBlock textures live in the pack's own namespaces; the "minecraft"
+        # namespace only holds vanilla overrides (paper, sticks, ...), which would
+        # otherwise be mistaken for SkyBlock icons. Only use it if nothing else exists.
+        self._index = main if len(main) >= 50 else {**vanilla_ns, **main}
+        self._models = models
+        self._model_by_stem = model_by_stem
+        self._definitions = definitions
+        self._all_pngs = all_pngs
+        self._report_info = [
+            "zips: " + ", ".join(f"{p.name} ({p.stat().st_size:,} bytes)" for p in zip_paths),
+            f"textures per namespace: {dict(sorted(namespaces.items(), key=lambda kv: -kv[1])[:12])}",
+            f"name index: {len(self._index)}  models: {len(models)}  item definitions: {len(definitions)}",
+            *self._cat_notes,
+        ]
+
+    def _write_report(self):
+        """Write icon_cache/furfsky_report.txt, which shows how each item's icon was found."""
+        try:
+            lines = ["FurfSky icon report", ""] + self._report_info + [""]
+            lines.append("sample of indexed names:")
+            for stem in sorted(self._index)[:25]:
+                lines.append(f"  {stem} -> {self._index[stem][1]}")
+            lines += ["", "icons resolved for this tree (how | file in the pack):"]
+            for item_id, (how, member) in sorted(self._resolved.items())[:300]:
+                lines.append(f"  {item_id:36s} {how:7s} {member}")
+            if self._bad_digests:
+                lines += ["", f"rejected as shared placeholder images: {len(self._bad_digests)}"]
+                for item_id in sorted(self._bad)[:60]:
+                    lines.append(f"  {item_id}")
+            (self.dir / "furfsky_report.txt").write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ---------------------------- images -----------------------------------
+
+    def _notify(self):
+        try:
+            self.root.after(0, self.on_change)
+        except Exception:
+            pass
+
+    def _note(self, text):
+        try:
+            self.root.after(0, lambda: self.on_note(text))
+        except Exception:
+            pass
+
+    def _scale(self, raw, big):
+        width = raw.width()
+        target = px(48 if big else 32)
+        if width >= target:
+            factor = max(1, int(width / target + 0.5))
+            return raw.subsample(factor, factor) if factor > 1 else raw
+        factor = max(1, int(target / width + 0.5))
+        return raw.zoom(factor, factor) if factor > 1 else raw
+
+    def _make_photo(self, data, big):
+        try:
+            raw = tk.PhotoImage(data=base64.b64encode(data))
+            width, height = raw.width(), raw.height()
+            if width <= 0 or height <= 0:
+                return None
+            if height >= 2 * width and height % width == 0:
+                # Animated texture strip: keep only the first frame.
+                frame = tk.PhotoImage()
+                frame.tk.call(str(frame), "copy", str(raw), "-from", 0, 0, width, width)
+                raw = frame
+            return self._scale(raw, big)
+        except (tk.TclError, ValueError):
+            return None
+
+    def _placeholder(self, big):
+        photo = self._placeholders.get(big)
+        if photo is None:
+            raw = tk.PhotoImage(width=16, height=16)
+            raw.put(BORDER_STRONG, to=(0, 0, 16, 16))
+            raw.put(SURFACE_ALT, to=(1, 1, 15, 15))
+            raw.put(BORDER_STRONG, to=(5, 5, 11, 11))
+            photo = self._scale(raw, big)
+            self._placeholders[big] = photo
+        return photo
+
+
+# ---------------------------------------------------------------------------
 # Starter recipe database
 # ---------------------------------------------------------------------------
 RECIPES = {
@@ -359,9 +1063,11 @@ class ItemPicker(tk.Toplevel):
 
     MAX_SHOWN = 500
 
-    def __init__(self, parent, title, items, display_name, initial_id=None):
+    def __init__(self, parent, title, items, display_name, initial_id=None, icon_for=None, tag_for=None):
         super().__init__(parent)
         self.parent = parent
+        self.icon_for = icon_for
+        self.tag_for = tag_for
         self.all_ids = sorted(set(items), key=lambda x: display_name(x).casefold())
         self.display_name = display_name
         self.result = None
@@ -400,11 +1106,12 @@ class ItemPicker(tk.Toplevel):
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(frame, columns=("name", "id"), show="headings", selectmode="browse")
-        self.tree.heading("name", text="Item", anchor="w")
+        self.tree = ttk.Treeview(frame, columns=("id",), show="tree headings", selectmode="browse", style="Picker.Treeview")
+        self.tree.heading("#0", text="Item", anchor="w")
         self.tree.heading("id", text="ID", anchor="w")
-        self.tree.column("name", width=px(300), anchor="w")
+        self.tree.column("#0", width=px(340), anchor="w")
         self.tree.column("id", width=px(220), anchor="w")
+        configure_rarity_tags(self.tree)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -439,7 +1146,12 @@ class ItemPicker(tk.Toplevel):
         self.matches = matches[: self.MAX_SHOWN]
         self.tree.delete(*self.tree.get_children())
         for index, item_id in enumerate(self.matches):
-            self.tree.insert("", "end", iid=str(index), values=(self.display_name(item_id), item_id))
+            options = {}
+            if self.icon_for:
+                options["image"] = self.icon_for(item_id)
+            if self.tag_for:
+                options["tags"] = (self.tag_for(item_id),)
+            self.tree.insert("", "end", iid=str(index), text=self.display_name(item_id), values=(item_id,), **options)
         if total > self.MAX_SHOWN:
             self.count_var.set(f"Showing the first {self.MAX_SHOWN} of {total:,} — keep typing to narrow it down")
         elif query:
@@ -473,7 +1185,7 @@ class ItemPicker(tk.Toplevel):
         return "break"
 
     def _on_double_click(self, event):
-        if self.tree.identify_region(event.x, event.y) == "cell":
+        if self.tree.identify_region(event.x, event.y) in ("cell", "tree"):
             self._accept()
 
     def _accept_first(self, _event=None):
@@ -495,9 +1207,11 @@ class ItemPicker(tk.Toplevel):
 class RecipeEditor(tk.Toplevel):
     """Friendly recipe editor with quantity + item-picker rows."""
 
-    def __init__(self, parent, output_id, recipe, item_ids, display_name, picker):
+    def __init__(self, parent, output_id, recipe, item_ids, display_name, picker, icon_for=None, color_for=None):
         super().__init__(parent)
         self.parent = parent
+        self.icon_for = icon_for
+        self.color_for = color_for
         self.output_id = output_id
         self.display_name = display_name
         self.item_ids = item_ids
@@ -607,6 +1321,13 @@ class RecipeEditor(tk.Toplevel):
             except tk.TclError:
                 pass
 
+    def _decorate(self, label, item_id):
+        """Show the item's icon and rarity colour on an ingredient label."""
+        if self.icon_for:
+            label.configure(image=self.icon_for(item_id))
+        if self.color_for:
+            label.configure(foreground=self.color_for(item_id))
+
     def _add_row(self, item_id=None, amount=1):
         row = ttk.Frame(self.rows_frame, style="Card.TFrame", padding=(px(2), px(7), px(2), 0))
         row.pack(fill="x")
@@ -621,8 +1342,11 @@ class RecipeEditor(tk.Toplevel):
             textvariable=name_var,
             style="Card.TLabel" if item_id else "Muted.Card.TLabel",
             anchor="w",
+            compound="left",
         )
         label.grid(row=0, column=1, sticky="ew")
+        if item_id:
+            self._decorate(label, normalize_id(item_id))
 
         selected = {"id": normalize_id(item_id) if item_id else None}
 
@@ -632,6 +1356,7 @@ class RecipeEditor(tk.Toplevel):
                 selected["id"] = picked
                 name_var.set(f"{self.display_name(picked)}  [{picked}]")
                 label.configure(style="Card.TLabel")
+                self._decorate(label, picked)
 
         ttk.Button(row, text="Choose…", style="Small.TButton", command=choose).grid(row=0, column=2, padx=(px(10), px(6)))
 
@@ -701,6 +1426,9 @@ class SkyblockTracker(tk.Tk):
         self.selected_path = None
         self.current_view = "tree"
         self._res_dirty = True
+        self._icon_job = None
+        self._icon_note = ""
+        self._status_state = ("Loading Hypixel item data…", "Loading item data…", "busy")
 
         saved = load_json(DATA_FILE, {})
         self.obtained = {
@@ -730,6 +1458,13 @@ class SkyblockTracker(tk.Tk):
                     RECIPES.pop(normalize_id(output), None)
 
         self._configure_style()
+        self.icons = IconStore(
+            self,
+            DATA_FILE.parent / "icon_cache",
+            lambda item_id: (self.items.get(item_id) or {}).get("material"),
+            self._icons_changed,
+            self._icon_status,
+        )
         self._build_ui()
         enable_dark_title_bar(self)
         self._load_api()
@@ -835,8 +1570,9 @@ class SkyblockTracker(tk.Tk):
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
         style.configure(
             "Treeview",
-            rowheight=px(34),
+            rowheight=px(48),
             font=(FONT, 10),
+            indent=px(26),
             background=SURFACE,
             fieldbackground=SURFACE,
             foreground=TEXT,
@@ -858,7 +1594,11 @@ class SkyblockTracker(tk.Tk):
             relief="flat",
         )
         style.map("Treeview.Heading", background=[("active", SURFACE_HOVER)], foreground=[("active", TEXT)])
-        style.map("Treeview", background=[("selected", SELECT_BG)], foreground=[("selected", TEXT_STRONG)])
+        # Leave item colors to their tags, including when the item is selected.
+        # This is essential for a checked-off item to remain green across *every*
+        # column, not just its status cell. The item picker uses its own style.
+        style.map("Treeview", background=[], foreground=[])
+        style.map("Picker.Treeview", background=[("selected", SELECT_BG)], foreground=[("selected", TEXT_STRONG)])
 
         # ---- entries ----
         style.configure(
@@ -920,10 +1660,20 @@ class SkyblockTracker(tk.Tk):
 
     def _set_status(self, text, sub, level):
         """Update the header status pill. level: 'busy', 'ok' or 'error'."""
+        self._status_state = (text, sub, level)
+        self._apply_status()
+
+    def _apply_status(self):
+        text, sub, level = self._status_state
         self.status.set(text)
-        self.header_sub.set(sub)
+        self.header_sub.set(f"{sub}   •   Icons: {self._icon_note}" if self._icon_note else sub)
         color = {"busy": AMBER, "ok": GREEN, "error": RED}.get(level, MUTED)
         self.status_dot.itemconfigure(self.status_dot_item, fill=color)
+
+    def _icon_status(self, note):
+        self._icon_note = note
+        if hasattr(self, "status_dot"):
+            self._apply_status()
 
     def _build_ui(self):
         # ---- header ----
@@ -962,7 +1712,7 @@ class SkyblockTracker(tk.Tk):
         footer.columnconfigure(0, weight=1)
         ttk.Label(
             footer,
-            text=f"{PLUS} Click the plus in any row to add one   •   Right-click an item for more options",
+            text=f"{PLUS} Add one in any row   •   Right-click for options   •   Green rows are complete",
             style="Footer.TLabel",
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
@@ -991,7 +1741,12 @@ class SkyblockTracker(tk.Tk):
         goal_card = Card(stats, padding=pad, accent=VIOLET)
         goal_card.grid(row=0, column=0, sticky="nsew", padx=(0, px(6)))
         ttk.Label(goal_card.body, text="GOAL", style="Caption.Card.TLabel").pack(anchor="w")
-        ttk.Label(goal_card.body, textvariable=self.goal_var, style="StatText.Card.TLabel").pack(anchor="w", pady=(px(2), 0))
+        goal_row = ttk.Frame(goal_card.body, style="Card.TFrame")
+        goal_row.pack(anchor="w", pady=(px(2), 0))
+        self.goal_icon = ttk.Label(goal_row, style="Card.TLabel")
+        self.goal_icon.pack(side="left", padx=(0, px(8)))
+        self.goal_label = ttk.Label(goal_row, textvariable=self.goal_var, style="StatText.Card.TLabel")
+        self.goal_label.pack(side="left")
         ttk.Label(goal_card.body, textvariable=self.goal_id_var, style="Muted.Card.TLabel").pack(anchor="w")
 
         progress_card = Card(stats, padding=pad, accent=ACCENT)
@@ -1038,21 +1793,21 @@ class SkyblockTracker(tk.Tk):
 
         columns = ("required", "owned", "remaining", "status", "add")
         self.tree = ttk.Treeview(tree_body, columns=columns, show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="Crafting tree", anchor="w")
+        self.tree.heading("#0", text="  CRAFTING TREE  /  ITEMS", anchor="w")
         self.tree.heading("required", text="Required")
         self.tree.heading("owned", text="Owned")
         self.tree.heading("remaining", text="Remaining")
         self.tree.heading("status", text="Status")
-        self.tree.column("#0", width=px(450), anchor="w")
+        self.tree.column("#0", width=px(510), minwidth=px(320), anchor="w")
         self.tree.column("required", width=px(90), anchor="e")
         self.tree.column("owned", width=px(85), anchor="e")
         self.tree.column("remaining", width=px(100), anchor="e")
         self.tree.column("status", width=px(105), anchor="center")
         self.tree.heading("add", text="")
         self.tree.column("add", width=px(48), anchor="center", stretch=False)
-        self.tree.tag_configure("root", font=(FONT, 10, "bold"), foreground=TEXT_STRONG)
-        self.tree.tag_configure("complete", foreground=GREEN)
-        self.tree.tag_configure("missing_recipe", foreground=AMBER)
+        self.tree.tag_configure("root", font=(FONT, 11, "bold"))
+        self.tree.tag_configure("branch", font=(FONT, 10, "bold"))
+        configure_rarity_tags(self.tree)
         self.tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(tree_body, orient="vertical", command=self.tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -1064,8 +1819,8 @@ class SkyblockTracker(tk.Tk):
 
         legend = ttk.Frame(tree_body, style="Card.TFrame", padding=(px(10), px(8), px(10), px(6)))
         legend.grid(row=1, column=0, columnspan=2, sticky="ew")
-        for text, color in (("●  Complete", GREEN), ("●  No recipe defined", AMBER), ("●  Needed", TEXT)):
-            ttk.Label(legend, text=text, style="Muted.Card.TLabel", foreground=color).pack(side="left", padx=(0, px(18)))
+        for tier in ("COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY", "MYTHIC"):
+            ttk.Label(legend, text=f"●  {tier.title()}", style="Muted.Card.TLabel", foreground=RARITY_COLORS[tier]).pack(side="left", padx=(0, px(14)))
 
         side = Card(content, padding=px(18), width=px(330))
         side.grid(row=0, column=1, sticky="ns", padx=(px(12), 0))
@@ -1078,7 +1833,12 @@ class SkyblockTracker(tk.Tk):
         self.sel_id = tk.StringVar(value="Pick an item in the crafting tree")
         self.sel_loc = tk.StringVar(value="")
         self.sel_count = tk.StringVar(value="")
-        ttk.Label(sb, textvariable=self.sel_name, style="ItemName.Card.TLabel", wraplength=wrap, justify="left").pack(anchor="w", pady=(px(4), 0))
+        sel_row = ttk.Frame(sb, style="Card.TFrame")
+        sel_row.pack(fill="x", pady=(px(6), 0))
+        self.sel_icon = ttk.Label(sel_row, style="Card.TLabel")
+        self.sel_icon.pack(side="left", padx=(0, px(10)))
+        self.sel_label = ttk.Label(sel_row, textvariable=self.sel_name, style="ItemName.Card.TLabel", wraplength=wrap - px(46), justify="left")
+        self.sel_label.pack(side="left", fill="x", expand=True)
         ttk.Label(sb, textvariable=self.sel_id, style="Muted.Card.TLabel", wraplength=wrap, justify="left").pack(anchor="w")
         self.item_progress = ttk.Progressbar(sb, orient="horizontal", mode="determinate", maximum=100, style="Item.Horizontal.TProgressbar")
         self.item_progress.pack(fill="x", pady=(px(12), px(5)))
@@ -1107,6 +1867,9 @@ class SkyblockTracker(tk.Tk):
 
         self._build_resource_view(views)
         self._show_view("tree")
+        self.bind_all("<Button-1>", self._on_background_click, add="+")
+        self.bind("<Escape>", lambda _e: self._deselect_current())
+        self._update_panel_looks()
         self.bind("<Control-Key-1>", lambda _e: self._show_view("tree"))
         self.bind("<Control-Key-2>", lambda _e: self._show_view("resources"))
 
@@ -1170,7 +1933,149 @@ class SkyblockTracker(tk.Tk):
         return sorted(set(self.items) | set(RECIPES) | set(FALLBACK_NAMES))
 
     def _pick_item(self, title="Choose Item", initial_id=None):
-        return ItemPicker(self, title, self.available_item_ids(), self.display_name, initial_id).result
+        return ItemPicker(
+            self, title, self.available_item_ids(), self.display_name, initial_id,
+            icon_for=lambda item_id: self.icons.get(item_id, network=False),
+            tag_for=self.rarity_tag,
+        ).result
+
+    # ----------------------- Rarity, icons, deselect -----------------------
+
+    def rarity_of(self, item_id):
+        tier = str((self.items.get(item_id) or {}).get("tier", "")).strip().upper().replace(" ", "_")
+        return tier if tier in RARITY_COLORS else "UNKNOWN"
+
+    def rarity_tag(self, item_id, done=False, selected=False, alternate=False):
+        """One mutually exclusive color tag for each row's current state."""
+        tag = f"rar_{self.rarity_of(item_id)}"
+        if done:
+            return tag + ("_done_selected" if selected else "_done")
+        if selected:
+            return tag + "_selected"
+        return tag + ("_alt" if alternate else "")
+
+    def _highlight_tree_selection(self, tree):
+        """Highlight only the old and new selected rows, preserving green rows.
+
+        ttk selection-color style maps cover row tag backgrounds by default,
+        so selection is rendered via mutually exclusive rarity/state tags.
+        """
+        attribute = "_tree_highlight" if tree is self.tree else "_resource_highlight"
+        selected = tree.selection()
+        current = selected[0] if selected else None
+        previous = getattr(self, attribute, None)
+        for node in {previous, current} - {None}:
+            if not tree.exists(node):
+                continue
+            tags = tuple(t for t in tree.item(node, "tags") if not t.startswith("rar_"))
+            if tree is self.tree:
+                item_id = tags[1] if len(tags) >= 2 else ""
+            else:
+                kind, _sep, reference = node.partition("|")
+                item_id = reference if kind == "r" else reference.split(PATH_SEP)[-1]
+            visual = self.rarity_tag(
+                item_id, done="complete" in tags, selected=node == current,
+                alternate="stripe" in tags,
+            )
+            tree.item(node, tags=tags + (visual,))
+        setattr(self, attribute, current)
+
+    def rarity_color(self, item_id):
+        return RARITY_COLORS[self.rarity_of(item_id)]
+
+    def _icons_changed(self):
+        """New icons arrived from the background thread; refresh soon (batched)."""
+        if self._icon_job is None:
+            self._icon_job = self.after(150, self._refresh_icons)
+
+    def _iter_nodes(self, tree, parent=""):
+        for child in tree.get_children(parent):
+            yield child
+            yield from self._iter_nodes(tree, child)
+
+    def _refresh_icons(self):
+        self._icon_job = None
+        if not hasattr(self, "res_tree"):
+            return
+        for node in self._iter_nodes(self.tree):
+            tags = self.tree.item(node, "tags")
+            if len(tags) >= 2:
+                self.tree.item(node, image=self.icons.get(normalize_id(tags[1])))
+        for iid in self._iter_nodes(self.res_tree):
+            kind, _sep, ref = iid.partition("|")
+            item_id = ref if kind == "r" else ref.split(PATH_SEP)[-1]
+            self.res_tree.item(iid, image=self.icons.get(item_id))
+        self._update_panel_looks()
+
+    def _update_panel_looks(self):
+        """Icons and rarity colours for the goal card and both side panels."""
+        self.goal_icon.configure(image=self.icons.get(self.root_item, big=True))
+        self.goal_label.configure(foreground=self.rarity_color(self.root_item))
+        if self.selected_item:
+            self.sel_icon.configure(image=self.icons.get(self.selected_item, big=True))
+            self.sel_label.configure(foreground=self.rarity_color(self.selected_item))
+        else:
+            self.sel_icon.configure(image="")
+            self.sel_label.configure(foreground=TEXT_STRONG)
+        res_item = None
+        if self.res_sel:
+            kind, ref = self.res_sel
+            res_item = ref if kind == "resource" else ref[-1]
+        if res_item:
+            self.res_icon.configure(image=self.icons.get(res_item, big=True))
+            self.res_label.configure(foreground=self.rarity_color(res_item))
+        else:
+            self.res_icon.configure(image="")
+            self.res_label.configure(foreground=TEXT_STRONG)
+
+    def _deselect_tree(self):
+        selection = self.tree.selection()
+        if selection:
+            self.tree.selection_remove(*selection)
+        self.selected_item = None
+        self.selected_path = None
+        self.sel_name.set("Nothing selected")
+        self.sel_id.set("Pick an item in the crafting tree")
+        self.sel_loc.set("")
+        self.sel_count.set("")
+        self.item_progress["value"] = 0
+        self.owned_var.set("0")
+        self.recipe_hint.set("Select an item to see its recipe options.")
+        self.recipe_button.configure(text="Define / Edit Recipe")
+        self._update_panel_looks()
+
+    def _deselect_res(self):
+        selection = self.res_tree.selection()
+        if selection:
+            self.res_tree.selection_remove(*selection)
+        self.res_sel = None
+        self.res_name.set("Nothing selected")
+        self.res_id.set("Pick an item in the list")
+        self.res_loc.set("")
+        self.res_count.set("")
+        self.res_progress["value"] = 0
+        self.res_owned_var.set("0")
+        self._update_panel_looks()
+
+    def _deselect_current(self):
+        if self.current_view == "resources":
+            self._deselect_res()
+        else:
+            self._deselect_tree()
+
+    def _on_background_click(self, event):
+        """Clicking blank window background (not a control or panel) clears the selection."""
+        widget = event.widget
+        try:
+            if widget.winfo_toplevel() is not self:
+                return
+            plain = widget is self or (
+                widget.winfo_class() == "TFrame" and str(widget.cget("style")) in ("", "TFrame")
+            )
+        except (tk.TclError, AttributeError, KeyError):
+            return
+        if plain:
+            self._deselect_current()
 
     # --------------------- Tree construction ------------------------------
 
@@ -1178,38 +2083,50 @@ class SkyblockTracker(tk.Tk):
         for child in self.tree.get_children():
             self.tree.delete(child)
 
+        self._tree_highlight = None
         root_name = self.display_name(self.root_item)
         root_path = (self.root_item,)
         root = self.tree.insert(
-            "", "end", text=root_name,
+            "", "end", text=f"◆  {root_name}",
             values=("1", self.obtained.get(path_to_key(root_path), 0), "-", "", PLUS),
-            open=True, tags=("root", self.root_item, make_path_tag(root_path)),
+            open=True, tags=("root", self.root_item, make_path_tag(root_path), self.rarity_tag(self.root_item)),
+            image=self.icons.get(self.root_item),
         )
         self._insert_recipe_children(root, self.root_item, 1, {self.root_item}, root_path)
         self._update_all_statuses()
         self.goal_var.set(root_name)
         self.goal_id_var.set(self.root_item)
+        self._update_panel_looks()
 
     def _insert_recipe_children(self, parent, item_id, multiplier, ancestors, path):
         item_id = normalize_id(item_id)
         ingredients = RECIPES.get(item_id, [])
         new_ancestors = ancestors | {item_id}
-        for ingredient_id, amount in ingredients:
-            ingredient_id = normalize_id(ingredient_id)
-            if ingredient_id in ancestors:
-                continue  # cycle guard: never recurse back into an ancestor
+        valid_ingredients = [(normalize_id(i), n) for i, n in ingredients if normalize_id(i) not in ancestors]
+        for position, (ingredient_id, amount) in enumerate(valid_ingredients):
             required = amount * multiplier
             child_path = path + (ingredient_id,)
-            child_tags = ("item", ingredient_id, make_path_tag(child_path))
-            if ingredient_id not in RECIPES:
-                child_tags = child_tags + ("missing_recipe",)
+            crafted = bool(RECIPES.get(ingredient_id))
+            # Native indentation and disclosure triangles remain interactive.
+            # Connector glyphs distinguish siblings at a glance.
+            connector = "└─" if position == len(valid_ingredients) - 1 else "├─"
+            child_tags = ["item", ingredient_id, make_path_tag(child_path)]
+            if crafted:
+                child_tags.append("branch")
+            else:
+                child_tags.append("missing_recipe")
+            # Alternate stripes by sibling position, keeping completed rows solid green.
+            if position % 2:
+                child_tags.append("stripe")
+            child_tags.append(self.rarity_tag(ingredient_id, alternate=bool(position % 2)))
             node = self.tree.insert(
                 parent,
                 "end",
-                text=f"{required:,} × {self.display_name(ingredient_id)}",
+                text=f"{connector}  {self.display_name(ingredient_id)}",
                 values=(required, self.obtained.get(path_to_key(child_path), 0), "", "", PLUS),
-                open=False,
-                tags=child_tags,
+                open=len(child_path) == 2 and crafted,
+                tags=tuple(child_tags),
+                image=self.icons.get(ingredient_id),
             )
             self._insert_recipe_children(node, ingredient_id, required, new_ancestors, child_path)
 
@@ -1237,12 +2154,15 @@ class SkyblockTracker(tk.Tk):
                 remaining = max(0, required - owned)
                 complete = required > 0 and owned >= required
                 status = "✓ Complete" if complete else "Needed"
+                item_id = normalize_id(tags[1]) if len(tags) >= 2 else ""
+                base = tuple(x for x in tags if x != "complete" and not x.startswith("rar_"))
                 if complete:
-                    new_tags = tuple(x for x in tags if x != "missing_recipe") + ("complete",)
-                    text = "✓ " + self.tree.item(node, "text").lstrip("✓ ")
+                    new_tags = base + ("complete", self.rarity_tag(item_id, True))
                 else:
-                    new_tags = tuple(x for x in tags if x != "complete")
-                    text = self.tree.item(node, "text").lstrip("✓ ")
+                    new_tags = base + (self.rarity_tag(item_id, alternate="stripe" in base),)
+                # Put completion in the green background and status column instead
+                # of inserting a checkmark in the tree label itself.
+                text = self.tree.item(node, "text").removeprefix("✓ ")
                 self.tree.item(node, text=text, values=(required, owned, remaining, status, PLUS), tags=new_tags)
                 walk(node)
 
@@ -1254,9 +2174,11 @@ class SkyblockTracker(tk.Tk):
             complete = owned >= 1
             root_tags = ("root", self.root_item, make_path_tag(root_path))
             if complete:
-                root_tags = root_tags + ("complete",)
+                root_tags += ("complete",)
+            root_tags += (self.rarity_tag(self.root_item, complete),)
             self.tree.item(root, values=(1, owned, max(0, 1 - owned), "✓ Complete" if complete else "Needed", PLUS), tags=root_tags)
             walk(root)
+        self._highlight_tree_selection(self.tree)
 
         # Keep the Total Resources view in step with every change.
         self._res_dirty = True
@@ -1285,6 +2207,7 @@ class SkyblockTracker(tk.Tk):
     # ----------------------- Selection / progress -------------------------
 
     def _selection_changed(self, _event=None):
+        self._highlight_tree_selection(self.tree)
         selection = self.tree.selection()
         if not selection:
             return
@@ -1308,6 +2231,7 @@ class SkyblockTracker(tk.Tk):
         self.sel_count.set(f"{owned:,} / {required:,} owned   •   {max(0, required - owned):,} remaining")
         self.item_progress["value"] = min(100, owned / required * 100) if required else 0
         self.owned_var.set(str(owned))
+        self._update_panel_looks()
         if self.selected_item in RECIPES:
             self.recipe_hint.set(f"Recipe has {len(RECIPES[self.selected_item])} ingredient type(s). Edit it if the quantities need changing.")
             self.recipe_button.configure(text="Edit Recipe")
@@ -1331,6 +2255,9 @@ class SkyblockTracker(tk.Tk):
     def _tree_click(self, event):
         node = self._plus_cell_at(event)
         if not node:
+            if self.tree.identify_region(event.x, event.y) == "nothing":
+                self._deselect_tree()  # clicked empty space below the rows
+                return "break"
             return None  # normal selection behaviour
         path = self._node_path(node)
         if not path:
@@ -1481,6 +2408,8 @@ class SkyblockTracker(tk.Tk):
             self.available_item_ids(),
             self.display_name,
             lambda title, initial=None: self._pick_item(title, initial),
+            icon_for=lambda item_id: self.icons.get(item_id),
+            color_for=self.rarity_color,
         )
         if editor.result is None:
             return
@@ -1532,7 +2461,7 @@ class SkyblockTracker(tk.Tk):
         else:
             self.res_view.grid_remove()
             self.tree_view.grid()
-            self.view_hint.set("Every sub-recipe, step by step from the goal down to raw materials")
+            self.view_hint.set("Expand a branch to trace ingredients  •  Green = complete")
 
     def _build_resource_view(self, parent):
         view = ttk.Frame(parent)
@@ -1566,23 +2495,22 @@ class SkyblockTracker(tk.Tk):
 
         columns = ("kind", "needed", "owned", "remaining", "status", "add")
         self.res_tree = ttk.Treeview(body, columns=columns, show="tree headings", selectmode="browse")
-        self.res_tree.heading("#0", text="Item  /  where it is needed", anchor="w")
+        self.res_tree.heading("#0", text="  RESOURCES  /  WHERE NEEDED", anchor="w")
         self.res_tree.heading("kind", text="Type")
         self.res_tree.heading("needed", text="Needed")
         self.res_tree.heading("owned", text="Owned")
         self.res_tree.heading("remaining", text="Remaining")
         self.res_tree.heading("status", text="Status")
         self.res_tree.heading("add", text="")
-        self.res_tree.column("#0", width=px(400), anchor="w")
+        self.res_tree.column("#0", width=px(460), minwidth=px(310), anchor="w")
         self.res_tree.column("kind", width=px(75), anchor="center")
         self.res_tree.column("needed", width=px(90), anchor="e")
         self.res_tree.column("owned", width=px(85), anchor="e")
         self.res_tree.column("remaining", width=px(100), anchor="e")
         self.res_tree.column("status", width=px(105), anchor="center")
         self.res_tree.column("add", width=px(48), anchor="center", stretch=False)
-        self.res_tree.tag_configure("resource", font=(FONT, 10, "bold"), foreground=TEXT_STRONG)
-        self.res_tree.tag_configure("occurrence", foreground="#aab6c9")
-        self.res_tree.tag_configure("complete", foreground=GREEN)
+        self.res_tree.tag_configure("resource", font=(FONT, 10, "bold"))
+        configure_rarity_tags(self.res_tree)
         self.res_tree.grid(row=1, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(body, orient="vertical", command=self.res_tree.yview)
         scroll.grid(row=1, column=1, sticky="ns")
@@ -1609,7 +2537,12 @@ class SkyblockTracker(tk.Tk):
         self.res_owned_var = tk.StringVar(value="0")
 
         ttk.Label(sb, text="SELECTED ITEM", style="Caption.Card.TLabel").pack(anchor="w")
-        ttk.Label(sb, textvariable=self.res_name, style="ItemName.Card.TLabel", wraplength=wrap, justify="left").pack(anchor="w", pady=(px(4), 0))
+        res_row = ttk.Frame(sb, style="Card.TFrame")
+        res_row.pack(fill="x", pady=(px(6), 0))
+        self.res_icon = ttk.Label(res_row, style="Card.TLabel")
+        self.res_icon.pack(side="left", padx=(0, px(10)))
+        self.res_label = ttk.Label(res_row, textvariable=self.res_name, style="ItemName.Card.TLabel", wraplength=wrap - px(46), justify="left")
+        self.res_label.pack(side="left", fill="x", expand=True)
         ttk.Label(sb, textvariable=self.res_id, style="Muted.Card.TLabel", wraplength=wrap, justify="left").pack(anchor="w")
         self.res_progress = ttk.Progressbar(sb, orient="horizontal", mode="determinate", maximum=100, style="Item.Horizontal.TProgressbar")
         self.res_progress.pack(fill="x", pady=(px(12), px(5)))
@@ -1775,13 +2708,14 @@ class SkyblockTracker(tk.Tk):
 
         for child in tree.get_children(""):
             tree.delete(child)
+        self._resource_highlight = None
 
         def status_text(required, covered):
             if required > 0 and covered >= required:
                 return "✓ Complete"
             return "In progress" if covered > 0 else "Needed"
 
-        for _group, _sort, item_id, name, crafted, places, needed, covered in rows:
+        for row_number, (_group, _sort, item_id, name, crafted, places, needed, covered) in enumerate(rows):
             complete = needed > 0 and covered >= needed
             iid = f"r|{item_id}"
             kind = "Crafted" if crafted else "Raw"
@@ -1789,9 +2723,12 @@ class SkyblockTracker(tk.Tk):
                 "", "end", iid=iid, text=name,
                 values=(kind, f"{needed:,}", f"{covered:,}", f"{needed - covered:,}", status_text(needed, covered), PLUS),
                 open=open_state.get(iid, False),
-                tags=("resource", "complete") if complete else ("resource",),
+                tags=("resource",) + (("stripe",) if row_number % 2 else ()) +
+                     (("complete",) if complete else ()) +
+                     (self.rarity_tag(item_id, complete, alternate=bool(row_number % 2)),),
+                image=self.icons.get(item_id),
             )
-            for place in places:
+            for place_number, place in enumerate(places):
                 required = place["required"]
                 owned = self._owned_at(place["path"])
                 place_covered = min(required, owned)
@@ -1802,7 +2739,10 @@ class SkyblockTracker(tk.Tk):
                     iid, "end", iid=f"p|{path_to_key(place['path'])}",
                     text=f"{required:,} × {where}",
                     values=(kind, f"{required:,}", f"{place_covered:,}", f"{required - place_covered:,}", status_text(required, place_covered), PLUS),
-                    tags=("occurrence", "complete") if done else ("occurrence",),
+                    tags=("occurrence",) + (("stripe",) if place_number % 2 else ()) +
+                         (("complete",) if done else ()) +
+                         (self.rarity_tag(item_id, done, alternate=bool(place_number % 2)),),
+                    image=self.icons.get(item_id),
                 )
 
         if groups:
@@ -1822,12 +2762,7 @@ class SkyblockTracker(tk.Tk):
             tree.selection_set(selected_iid)
             self._res_selection_changed()
         elif selected_iid:
-            self.res_sel = None
-            self.res_name.set("Nothing selected")
-            self.res_id.set("Pick an item in the list")
-            self.res_loc.set("")
-            self.res_count.set("")
-            self.res_progress["value"] = 0
+            self._deselect_res()
 
     def _res_set_open(self, flag):
         for iid in self.res_tree.get_children(""):
@@ -1836,6 +2771,7 @@ class SkyblockTracker(tk.Tk):
     # ---- selection panel ----
 
     def _res_selection_changed(self, _event=None):
+        self._highlight_tree_selection(self.res_tree)
         selection = self.res_tree.selection()
         if not selection:
             return
@@ -1865,6 +2801,7 @@ class SkyblockTracker(tk.Tk):
         self.res_count.set(f"{owned_total:,} / {required_total:,} owned   •   {remaining:,} remaining")
         self.res_progress["value"] = min(100, owned_total / required_total * 100) if required_total else 0
         self.res_owned_var.set(str(owned_total))
+        self._update_panel_looks()
 
     # ---- editing ----
 
@@ -1925,6 +2862,9 @@ class SkyblockTracker(tk.Tk):
     def _res_click(self, event):
         iid = self._res_plus_cell_at(event)
         if not iid:
+            if self.res_tree.identify_region(event.x, event.y) == "nothing":
+                self._deselect_res()  # clicked empty space below the rows
+                return "break"
             return None  # normal selection behaviour
         self.res_tree.selection_set(iid)
         self._res_selection_changed()
