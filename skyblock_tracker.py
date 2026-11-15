@@ -39,6 +39,7 @@ from tkinter import ttk, messagebox, filedialog
 
 import hypixel_sync as hs
 import hypixel_economy as he
+from recipe_tree_canvas import RecipeTreeCanvas
 
 API_URL = "https://api.hypixel.net/v2/resources/skyblock/items"
 DISCLAIMER = "Not affiliated with or endorsed by Hypixel Inc. or Mojang Studios."
@@ -2020,8 +2021,10 @@ class SkyblockTracker(tk.Tk):
             p["set_button"].configure(text="Set Owned Amount")
             p["entry"].set(str(owned))
             p["stock"].set("Manual mode: counts belong to this row only.")
+    
 
     # ---------------- views ----------------
+
     def _build_tree_view(self, parent):
         view = ttk.Frame(parent)
         view.grid(row=0, column=0, sticky="nsew")
@@ -2033,22 +2036,28 @@ class SkyblockTracker(tk.Tk):
         body = card.body
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
-        cols = {"required": ("Required", 100, "e"), "owned": ("Have", 95, "e"),
-                "remaining": ("Short", 100, "e"), "status": ("Status", 110, "center"),
-                "add": ("", 48, "center")}
-        self.tree = self._table(body, 0, cols, {"#0": 470}, "  CRAFTING TREE  /  ITEMS")
-        self.tree.tag_configure("root", font=(FONT, 11, "bold"))
-        self.tree.tag_configure("branch", font=(FONT, 10, "bold"))
-        self.tree.bind("<<TreeviewSelect>>", self._sel_tree)
-        self.tree.bind("<Button-3>", self._tree_menu)
-        self.tree.bind("<Button-1>", lambda e: self._plus_click(e, self.tree, "#5", self._tree_bump, self._deselect_tree))
-        self.tree.bind("<Motion>", lambda e: self._plus_motion(e, self.tree, "#5"))
+        palette = {name: globals()[name] for name in (
+            "BG", "SURFACE", "SURFACE_ALT", "SURFACE_HOVER", "BORDER", "BORDER_STRONG",
+            "HEADER_BG", "TEXT", "TEXT_STRONG", "MUTED", "ACCENT", "GREEN", "AMBER",
+            "RED", "GOLD", "TREE_DONE_BG", "TREE_DONE_FG", "SELECT_BG")}
+        self.tree = RecipeTreeCanvas(
+            body, display_name=self.display_name, rarity_color=self.rarity_color,
+            icon_for=lambda i: self.icons.get(i), fmt_qty=self._q,
+            recipe_of=self._recipe_of, status_text=self._status_text,
+            on_select=lambda _entry: self._sel_tree(),
+            on_bump=self._tree_bump_entry,
+            on_menu=self._tree_menu_at,
+            on_background=self._deselect_tree,
+            palette=palette, font_family=FONT)
+        self.tree.grid(row=0, column=0, sticky="nsew")
         legend = ttk.Frame(body, style="Card.TFrame", padding=(px(10), px(8), px(10), px(6)))
-        legend.grid(row=1, column=0, columnspan=2, sticky="ew")
+        legend.grid(row=1, column=0, sticky="ew")
         for tier in ("COMMON", "UNCOMMON", "RARE", "EPIC", "LEGENDARY", "MYTHIC"):
             ttk.Label(legend, text=f"●  {tier.title()}", style="Muted.Card.TLabel",
                       foreground=RARITY_COLORS[tier]).pack(side="left", padx=(0, px(12)))
         ttk.Label(legend, text="●  Coins", style="Muted.Card.TLabel", foreground=GOLD).pack(side="left")
+        ttk.Label(legend, text="●  Complete", style="Muted.Card.TLabel",
+                  foreground=GREEN).pack(side="left", padx=(px(12), 0))
         panel, self.p_tree = self._make_panel(view, on_set=self._tree_set, on_bump=self._tree_bump_selected,
                                               on_complete=self._tree_complete,
                                               action_text="Define / Edit Recipe",
@@ -2240,10 +2249,10 @@ class SkyblockTracker(tk.Tk):
         if self._dirty.get(name):
             self._render_view(name)
         self.view_hint.set({
-            "tree": "Expand a branch to trace ingredients",
+            "tree": "Drag to pan  •  Ctrl+scroll to zoom  •  double-click a node or its ± badge to expand its ingredients",
             "resources": "Every item combined across all sub-recipes",
             "stock": "The item map pulled from your account",
-            "cost": "Baazar prices - Ctrl+P refreshes prices",
+            "cost": "Bazaar prices - Ctrl+P refreshes prices",
         }[name])
 
     def _set_mode(self, mode):
@@ -2340,11 +2349,12 @@ class SkyblockTracker(tk.Tk):
 
     def _refresh_icons(self):
         self._icon_job = None
-        for tree in (self.tree, self.res_tree, self.stock_tree, self.cost_tree):
+        for tree in (self.res_tree, self.stock_tree, self.cost_tree):
             for node in self._iter_nodes(tree):
                 tags = tree.item(node, "tags")
                 if len(tags) >= 2 and tags[1] and "group" not in tags:
                     tree.item(node, image=self.icons.get(normalize_id(tags[1])))
+        self.tree.refresh_icons()
         self.goal_icon.configure(image=self.icons.get(self.root_item, big=True))
         res_item = None
         if self.res_sel:
@@ -2368,7 +2378,7 @@ class SkyblockTracker(tk.Tk):
             self._deselect_current()
 
     def _deselect_tree(self):
-        self.tree.selection_remove(*self.tree.selection())
+        self.tree.clear_selection()
         self.sel_item = self.sel_path = None
         self._panel_clear(self.p_tree)
 
@@ -2839,35 +2849,10 @@ class SkyblockTracker(tk.Tk):
         if owned >= required:
             return "✓ Complete"
         return "In progress" if owned > 0 else "Needed"
-
+    
     def _render_tree(self):
-        state = self._capture_state(self.tree)
-        self.tree.delete(*self.tree.get_children(""))
-        self._highlight_ids["tree"] = None
-        first = not state[0]
-        for index, entry in enumerate(self.plan_order):
-            path, item = entry["path"], entry["item"]
-            parent = "t|" + path_to_key(path[:-1]) if len(path) > 1 else ""
-            required, owned = entry["required"], entry["owned"]
-            done = (required > 0 and owned >= required) or required == 0
-            if len(path) == 1:
-                kind, text = "root", "◆  " + self.display_name(item)
-            else:
-                siblings = self._recipe_of(path[-2])
-                pos = next((i for i, (c, _n) in enumerate(siblings) if c == item), 0)
-                conn = "└─" if pos == len(siblings) - 1 else "├─"
-                kind = "branch" if entry["crafted"] else "missing_recipe"
-                text = f"{conn}  {self.display_name(item)}"
-            tags = [kind, item] + (["stripe"] if index % 2 else []) + (["complete"] if done else [])
-            tags.append(self.rarity_tag(item, done, alternate=bool(index % 2)))
-            self.tree.insert(parent, "end", iid="t|" + entry["key"], text=text,
-                             values=(self._q(item, required), self._q(item, owned),
-                                     self._q(item, max(0, required - owned)),
-                                     self._status_text(required, owned), PLUS),
-                             open=(len(path) <= 2 and entry["crafted"]) if first else False,
-                             tags=tuple(tags), image=self.icons.get(item))
-        self._restore_state(self.tree, state)
-        if self.tree.selection():
+        self.tree.set_plan(self.plan_order, self.root_item, self.plan_truncated)
+        if self.tree.selected_entry():
             self._sel_tree()
         if self.plan_truncated:
             self.view_hint.set("Tree stopped at a safety limit — check for a recipe loop involving "
@@ -3065,11 +3050,7 @@ class SkyblockTracker(tk.Tk):
 
     # ---------------- selection ----------------
     def _sel_tree(self, _event=None):
-        self._highlight(self.tree, "tree")
-        sel = self.tree.selection()
-        if not sel:
-            return
-        entry = self.plan.get(sel[0][2:])
+        entry = self.tree.selected_entry()
         if not entry:
             return
         self.sel_item, self.sel_path = entry["item"], entry["path"]
@@ -3213,8 +3194,7 @@ class SkyblockTracker(tk.Tk):
             self._set_owned_amount(self.sel_path, amount)
         self._sel_tree()
 
-    def _tree_bump(self, node):
-        entry = self.plan.get(node[2:])
+    def _tree_bump_entry(self, entry):
         if not entry:
             return
         step = 100000 if entry["item"] == COINS else 1
@@ -3222,15 +3202,16 @@ class SkyblockTracker(tk.Tk):
             self._bump_stock(entry["item"], step)
         else:
             self._set_owned_amount(entry["path"], int(self.obtained.get(entry["key"], 0)) + step)
-        if self.tree.exists(node):
-            self.tree.selection_set(node)
-            self._sel_tree()
+        self.tree.select(entry["key"])
+        self._sel_tree()
 
     def _tree_bump_selected(self):
         if not self.sel_path:
-            messagebox.showinfo("Select an item", "Select a row in the tree first.")
+            messagebox.showinfo("Select an item", "Select a node in the tree first.")
             return
-        self._tree_bump("t|" + path_to_key(self.sel_path))
+        entry = self.plan.get(path_to_key(self.sel_path))
+        if entry:
+            self._tree_bump_entry(entry)
 
     def _tree_complete(self):
         if not self.sel_path:
@@ -3246,11 +3227,8 @@ class SkyblockTracker(tk.Tk):
             self._set_owned_amount(entry["path"], max(entry["owned"], entry["required"]))
         self._sel_tree()
 
-    def _tree_menu(self, event):
-        node = self.tree.identify_row(event.y)
-        if not node:
-            return
-        self.tree.selection_set(node)
+    def _tree_menu_at(self, entry, x_root, y_root):
+        self.tree.select(entry["key"])
         self._sel_tree()
         menu = tk.Menu(self, tearoff=False, background=SURFACE_ALT, foreground=TEXT,
                        activebackground=ACCENT, activeforeground="#fff", activeborderwidth=0,
@@ -3258,12 +3236,17 @@ class SkyblockTracker(tk.Tk):
         menu.add_command(label="Mark Complete", command=self._tree_complete)
         menu.add_command(label="Set Amount", command=self._tree_set)
         menu.add_separator()
+        menu.add_command(label="Expand branch",
+                         command=lambda k=entry["key"]: self.tree.expand_branch(k))
+        menu.add_command(label="Collapse branch",
+                         command=lambda k=entry["key"]: self.tree.collapse_branch(k))
+        menu.add_separator()
         menu.add_command(label="Define / Edit Recipe", command=self._edit_selected_recipe)
         if self.sel_item and self.sel_item != COINS:
             menu.add_command(label="Set Manual Price…", command=lambda: self._set_price(self.sel_item))
             menu.add_command(label="Use as Goal", command=lambda: self._set_root(self.sel_item))
         menu.add_command(label="Add Manual / island-chest count", command=self._edit_manual_counts)
-        menu.tk_popup(event.x_root, event.y_root)
+        menu.tk_popup(x_root, y_root)
 
     def _res_target(self):
         if not self.res_sel:
@@ -3344,16 +3327,8 @@ class SkyblockTracker(tk.Tk):
 
     def _reveal_tree_path(self, path):
         self._show_view("tree")
-        iid = "t|" + path_to_key(path)
-        if self.tree.exists(iid):
-            parent = self.tree.parent(iid)
-            while parent:
-                self.tree.item(parent, open=True)
-                parent = self.tree.parent(parent)
-            self.tree.selection_set(iid)
-            self.tree.focus(iid)
-            self.tree.see(iid)
-            self._sel_tree()
+        self.tree.reveal(path_to_key(path))
+        self._sel_tree()
 
     def _stock_set(self):
         if not self.stock_sel:

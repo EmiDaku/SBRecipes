@@ -270,16 +270,118 @@ An alias table handles known differences:
 | … | … |
 
 Anything else shows **"not on bazaar"** until you link or price it.
+---
+## 6. Recipe Tree Canvas
+
+Shortcut: `Ctrl+1` · Module: `recipe_tree_canvas.py`
+
+The Recipe Tree tab is a node-and-branch diagram drawn on a canvas, not a table. The **goal sits on the left** and ingredients flow to the right, one column per recipe depth. Total Resources, Account Stock and Coin Cost are still tables.
+
+Branch structure is taken from each entry's recipe **path**, the same paths the allocation engine uses, so what you can expand always matches what is actually being counted.
+
+### 6.1 Node cards
+
+| Element | Meaning |
+| --- | --- |
+| Left accent bar | Rarity colour — green once the node is complete |
+| Icon | FurfSky Reborn texture, or the vanilla fallback |
+| Name | Rarity colour, bold; truncated with `…` when narrow (full text in the tooltip) |
+| Counts line | `have / required` — coins compact (`12.5M`), items comma-grouped |
+| Status line | `✓ Complete`, `✓ Not needed`, `In progress` or `Needed`, plus `short N` |
+| ＋ button | Adds 1 to owned (100,000 for coins) at that node |
+| ± badge on the right edge | Folds/unfolds the branch; `+N` underneath counts hidden descendants |
+
+A completed node keeps its green card fill **even while selected**; selection is shown by an accent outline. Below the canvas is the legend: rarity tiers, Coins (gold) and Complete (green).
+
+### 6.2 Links
+
+- Curved arrow from the parent's right edge to the child's left edge.
+- Colour follows the **child's** state: green = complete, amber = in progress, muted = still needed.
+- A `×N` pill on the link is the per-craft ingredient amount from the parent's recipe. It is shown when the amount is more than 1 and hidden when you zoom far out.
+- A faint blueprint grid sits behind the graph for depth reference.
+
+### 6.3 Zoom
+
+| Control | Action |
+| --- | --- |
+| `Ctrl` + mouse wheel | Zoom anchored at the cursor — the point under the pointer stays put |
+| **−** / **＋** toolbar buttons | Step zoom (×1.25) about the viewport centre |
+| Slider | Continuous zoom |
+| `%` readout | Current level |
+| **Fit tree** | Frame the whole visible tree (capped at 125% so small trees don't blow up) |
+| **100%** | Reset to 1:1 |
+| `+` / `=` / `-` keys | Zoom in / out (canvas focused) |
+| `0` | Back to 100% |
+| `f` or `Home` | Fit tree |
+
+Range **20% – 300%**. Cards, fonts, icons, link widths and arrowheads are **re-rendered** at every level rather than bitmap-stretched, so text stays sharp.
+
+Below 45% zoom — or above 1,200 visible nodes — cards switch to a compact form (icon + name + buttons) and multiplier pills are hidden, so very large plans stay responsive.
+
+### 6.4 Pan and scroll
+
+| Control | Action |
+| --- | --- |
+| Drag on empty canvas | Pan |
+| Middle-drag anywhere | Pan (works over cards too) |
+| Mouse wheel | Scroll vertically |
+| `Shift` + wheel | Scroll horizontally |
+| Scrollbars | Themed horizontal **and** vertical bars |
+
+Linux `Button-4/5` wheel events are handled, with `Ctrl` and `Shift` variants.
+
+### 6.5 Folding branches
+
+- **Only the root starts open.** A new goal shows its immediate ingredients; every deeper branch is folded until you open it.
+- **Double-click a node** — or single-click its `±` badge — to expand/collapse one level.
+- `Enter` or `Space` toggles the selected node; `→` expands it, `←` collapses it.
+- A folded badge shows `+N`, the total number of descendants hidden beneath it.
+- **Expand all** / **Collapse all** in the toolbar (Collapse all returns to root-only).
+- Right-click → **Expand branch** / **Collapse branch** acts on the whole subtree.
+- Double-clicking the `＋` count button bumps the count and never folds the branch.
+- A node you expand is scrolled into view automatically if it would land off-screen.
+
+### 6.6 Minimap
+
+A live overview in the bottom-right corner: one block per visible node, coloured by status, with links, plus a draggable rectangle showing your viewport. Click or drag inside it to jump around a large tree. Toggle it with the **Minimap** checkbox.
+
+### 6.7 Hover tooltips
+
+Resting on a card for a moment shows the full item name, the raw item id, `have / need / short`, the `In: …` recipe chain (or "Root goal"), and the ingredient count with its expanded/collapsed state.
+
+### 6.8 When a node will not expand
+
+A short amber note appears above the node instead of failing silently:
+
+| Note | Meaning |
+| --- | --- |
+| No recipe defined yet | It really is a raw leaf — right-click → **Define / Edit Recipe** |
+| Its ingredients already appear above it in this branch | Loop guard: the recipe points back at an ancestor |
+| Branch stopped at the tree safety limit | The node/depth cap was hit — see [8.4](#84-safety) |
+| No sub-ingredients are listed for this branch | The recipe resolved to nothing walkable |
+| Coins are a currency | Edit the parent recipe to change that coin cost |
+
+### 6.9 Selection and actions
+
+- **Click a card** → the side panel (same panel as every other tab: Set Amount, Mark Complete, Define/Edit Recipe).
+- **Right-click a card** → Mark Complete · Set Amount · Expand branch · Collapse branch · Define/Edit Recipe · Set Manual Price… · Use as Goal · Add Manual/island-chest count.
+- **`Esc`**, or a click on empty canvas, clears the selection and the panel.
+- **Show in Recipe Tree** from Total Resources or Coin Cost opens every ancestor, expands the target node itself, selects it and centres it.
+
+### 6.10 View state
+
+Zoom, pan, folds and selection survive syncs, `＋` clicks, recipe edits, counting-preset changes and tab switches. **Fit tree** runs automatically on first load and whenever you change the goal; folds then reset to root-only. This is session view state — it is not written to the save file.
+
 
 ---
 
-## 6. Caching, Timing and Policy Compliance
+## 7. Caching, Timing and Policy Compliance
 
-### 6.1 No background polling. Ever.
+### 7.1 No background polling. Ever.
 
 A pull happens only on a click (**Sync** / `Ctrl+R`, **Refresh Prices** / `Ctrl+P`) or once at launch if that cache is stale. The policy bans continuous polling of player data and session tracking, and asks for caching measured in hours or days.
 
-### 6.2 Persisted minimum intervals
+### 7.2 Persisted minimum intervals
 
 | Endpoint | Default | Floor | Selectable up to |
 | --- | --- | --- | --- |
@@ -288,15 +390,15 @@ A pull happens only on a click (**Sync** / `Ctrl+R`, **Refresh Prices** / `Ctrl+
 
 Both timestamps are written **before** the request, so crashing or restarting cannot pull faster. Clicking early shows the remaining time.
 
-### 6.3 Close time / start-up check
+### 7.3 Close time / start-up check
 
 On close, `last_closed` = system time is written. At launch the app compares *now* against `last_closed` **and** the cache's `fetched_at`; if both are older than the interval and the cooldown has expired, exactly one pull happens. **Fresh cache = zero requests.**
 
-### 6.4 HTTP 429
+### 7.4 HTTP 429
 
 `RateLimit-Reset` is honoured and turned into a cooldown.
 
-### 6.5 Key hygiene
+### 7.5 Key hygiene
 
 - Never in source, the `.bat`, the exe, the save file, either cache, a log or an error message.
 - Masked in the UI.
@@ -304,7 +406,7 @@ On close, `last_closed` = system time is written. At launch the app compares *no
 - Read from `HYPIXEL_API_KEY` (priority) or the local key file.
 - Bazaar and the items catalogue never receive it.
 
-### 6.6 Also honoured
+### 7.6 Also honoured
 
 - "Not affiliated or endorsed" notice in the footer and Settings.
 - No gambling, monetisation, paywall or proxying.
@@ -316,9 +418,9 @@ On close, `last_closed` = system time is written. At launch the app compares *no
 
 ---
 
-## 7. Counting Methodology
+## 8. Counting Methodology
 
-### 7.1 Modes
+### 8.1 Modes
 
 | Mode | Behaviour |
 | --- | --- |
@@ -327,7 +429,7 @@ On close, `last_closed` = system time is written. At launch the app compares *no
 
 The app starts in **Manual** until the first successful sync, then switches to **From Hypixel**. Manual progress is never overwritten by syncing.
 
-### 7.2 Allocation (From Hypixel)
+### 8.2 Allocation (From Hypixel)
 
 Depth-first, in tree order:
 
@@ -341,14 +443,14 @@ children required   = per-craft amount x shortfall
 - Holding an intermediate reduces its own ingredients.
 - Owning the goal marks the whole tree "not needed".
 
-### 7.3 Quantity boxes
+### 8.3 Quantity boxes
 
 In From Hypixel mode every quantity box means "account stock for this item" (or "coins available"). Typing a number writes a **manual adjustment**, so you can record mining or spending without a request.
 
 - **Mark Complete** adds exactly the shortfall.
 - **Reset Progress** clears adjustments, never synced data.
 
-### 7.4 Safety
+### 8.4 Safety
 
 - Duplicate ingredient rows are merged (unique paths).
 - Recipe cycles are skipped.
@@ -356,13 +458,13 @@ In From Hypixel mode every quantity box means "account stock for this item" (or 
 
 ---
 
-## 8. UI
+## 9. UI
 
-### 8.1 Header
+### 9.1 Header
 
 Logo, title, live subtitle, account pill, status pill.
 
-### 8.2 Toolbar
+### 9.2 Toolbar
 
 | Button | Shortcut |
 | --- | --- |
@@ -374,7 +476,7 @@ Logo, title, live subtitle, account pill, status pill.
 | Export | |
 | Reset Progress | |
 
-### 8.3 Five stat cards
+### 9.3 Five stat cards
 
 1. **Goal**
 2. **Materials covered** (coins excluded)
@@ -382,7 +484,7 @@ Logo, title, live subtitle, account pill, status pill.
 4. **Coins to finish** (have / short / unpriced)
 5. **Items in your account** (coins excluded from the item count)
 
-### 8.4 Four views (`Ctrl+1` … `Ctrl+4`)
+### 9.4 Four views (`Ctrl+1` … `Ctrl+4`)
 
 | View | Description |
 | --- | --- |
@@ -391,15 +493,15 @@ Logo, title, live subtitle, account pill, status pill.
 | **Account Stock** | The raw item map: in stock / needed / allocated / surplus / containers, expandable per container, searchable, "only items this goal needs", Use as Goal |
 | **Coin Cost** | See [section 5](#5-coin-cost-tab) |
 
-### 8.5 Side panels
+### 9.5 Side panels
 
 Consistent side panels with a per-item source breakdown.
 
-### 8.6 Settings
+### 9.6 Settings
 
 Account · API key · Sync behaviour · Counting defaults · Coin cost & bazaar prices · Local data · About.
 
-### 8.7 Quality-of-life
+### 9.7 Quality-of-life
 
 - Expansion, selection and scroll position survive rebuilds.
 - 1-second footer clock (last sync, next allowed sync, price age, mode).
@@ -409,7 +511,7 @@ Account · API key · Sync behaviour · Counting defaults · Coin cost & bazaar 
 
 ---
 
-## 9. Recipes
+## 10. Recipes
 
 Recipes are added **by hand** with the visual row editor (quantity + item picker, no syntax). Hypixel's items resource carries no recipe graph, so nothing about recipes is downloaded.
 
@@ -419,7 +521,7 @@ Recipes are added **by hand** with the visual row editor (quantity + item picker
 
 ---
 
-## 10. Known Limitations
+## 11. Known Limitations
 
 - **Island chests:** not in the public API (use Manual Counts).
 - **Purse / bank:** a snapshot from the moment of the sync.
@@ -433,7 +535,25 @@ Recipes are added **by hand** with the visual row editor (quantity + item picker
 
 ---
 
-## 11. Changelog
+## 12. Changelog
+
+### 3.2 — visual tree edition
+
+- **Recipe Tree tab rebuilt as a real node-and-branch canvas** (new module `recipe_tree_canvas.py`); the other three tabs are unchanged.
+- Rarity-coloured node cards with icon, name, have/need, status and shortfall; green completion fill survives selection.
+- Curved, status-coloured links with arrowheads and `×N` per-craft multiplier pills; blueprint grid backdrop.
+- **Zoom 20–300%**: `Ctrl`+wheel anchored at the cursor, −/＋ buttons, live slider, `%` readout, **Fit tree**, **100%**, and `+` `-` `0` `f` `Home` keys. Everything re-renders at each level instead of bitmap-scaling.
+- **Pan and scroll**: drag empty space, middle-drag anywhere, wheel / `Shift`+wheel, themed horizontal *and* vertical scrollbars.
+- **Foldable branches** with `±` badges and `+N` hidden-descendant counts; only the root starts open; double-click, `Enter`/`Space`, `→`/`←`, Expand/Collapse all, and per-subtree right-click commands.
+- **Live minimap** with a draggable viewport rectangle, toggleable from the toolbar.
+- **Hover tooltips** with full name, item id, counts, recipe chain and branch state.
+- Explanatory amber flash when a node cannot expand: no recipe / loop guard / safety limit / coins.
+- `＋` bump, click-to-select, right-click menu and cross-tab **Show in Recipe Tree** all preserved; reveal now opens ancestors *and* the target node, then centres it.
+- Zoom, pan, folds and selection survive syncs, count bumps, recipe edits and tab switches.
+- Compact-card rendering keeps very large plans responsive.
+- **Fix:** branch structure is derived from recipe paths rather than a reconstructed key string, so nodes below the first level expand correctly (previously only the root's children could be opened).
+- **Fix:** the trailing button-release of a double-click no longer re-toggles a branch or selects a stale node.
+- `build_exe.bat` unchanged — PyInstaller bundles the new module via the import.
 
 ### 3.1
 
