@@ -1,6 +1,19 @@
 # Build and distribution directories
 dist/
 build/
+__pycache__
 
 # SkyBlock Tracker spec file
 skyblocktracker.spec
+
+hypixel_api_key.txt
+hypixel_cache.json
+hypixel_state.json
+hypixel_bazaar.json
+hypixel_bazaar_state.json
+skyblock_tracker_data.json
+icon_cache/
+debug_inventory.py
+verify_sync.py
+rebuild_cache.py
+*.spec

@@ -1,0 +1,47 @@
+WHERE TO PUT YOUR HYPIXEL API KEY
+=================================
+Never put it in skyblock_tracker.py, hypixel_sync.py, hypixel_economy.py or
+build_exe.bat, and never ship it inside a built exe. Register your own
+application in the Hypixel Developer Portal (developer.hypixel.net) first.
+
+WHAT NEEDS THE KEY
+------------------
+  Inventory / storage / museum / purse / bank  ->  YES  (/v2/skyblock/profiles,
+                                                       /v2/skyblock/museum)
+  Item names, rarities, icons                  ->  NO   (/v2/resources/skyblock/items)
+  Bazaar prices for the Coin Cost tab          ->  NO   (/v2/skyblock/bazaar)
+  Mojang name -> UUID lookup                   ->  NO
+So prices and the recipe tree work even before you add a key.
+
+Pick ONE of these three:
+
+1) In the app (easiest)
+   Run the app -> "Settings" -> API KEY box -> paste -> Save Key.
+   It is written to:
+     exe    : %APPDATA%\SkyBlockTracker\hypixel_api_key.txt
+     source : <folder with skyblock_tracker.py>\hypixel_api_key.txt
+
+2) Environment variable (takes priority over the file)
+   Windows, permanent:   setx HYPIXEL_API_KEY "your-key-here"
+   then open a NEW terminal / relaunch the app.
+   Current session only: set HYPIXEL_API_KEY=your-key-here
+
+3) Create the file yourself
+   Put the key on a single line in hypixel_api_key.txt in the folder above.
+
+Then: enter your Minecraft username (or UUID) in the same dialog, press
+"Look up UUID", and click "Save & Sync Now". Your purse and bank are read from
+that same request - nothing extra to configure.
+
+If you publish the source, add this to .gitignore:
+   hypixel_api_key.txt
+   hypixel_cache.json
+   hypixel_state.json
+   hypixel_bazaar.json
+   hypixel_bazaar_state.json
+   skyblock_tracker_data.json
+   icon_cache/
+   build/
+   dist/
+   *.spec
+   

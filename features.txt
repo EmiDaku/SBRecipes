@@ -1,0 +1,300 @@
+==========================================================================
+ SKYBLOCK CRAFTING TRACKER  -  FEATURE LOG
+ Version 3.1  "account + coin edition"
+==========================================================================
+Not affiliated with or endorsed by Hypixel Inc. or Mojang Studios.
+Requires Python 3.9+ and Tkinter. No third-party packages.
+
+--------------------------------------------------------------------------
+ 1. FILES
+--------------------------------------------------------------------------
+skyblock_tracker.py   UI, recipe tree, allocation engine, Coin Cost tab, icons.
+hypixel_sync.py       NBT reader, item identity, API client, cache, cooldowns,
+                      counting presets, coin sources.
+hypixel_economy.py    Bazaar client, price cache, coin formatting, cost maths.
+build_exe.bat         One-file Windows build (bundles all three modules).
+features.txt          This file.
+API_KEY_SETUP.txt     Where the API key goes.
+hypixel_api_policy.txt  The policy this build is written against (reference).
+myicon.ico            Optional window/exe icon; the build works without it.
+
+Created at runtime in the data folder:
+skyblock_tracker_data.json   recipes, goal, manual counters, settings,
+                             manual/island-chest counts, manual prices,
+                             bazaar links, last_closed.
+hypixel_cache.json           aggregated item map (incl. coins) + sync time.
+hypixel_state.json           profile cooldowns, name->UUID cache.
+hypixel_bazaar.json          cached bazaar prices + fetch time.
+hypixel_bazaar_state.json    bazaar cooldown (survives cache clearing).
+hypixel_api_key.txt          YOUR KEY (only if you use the in-app field).
+icon_cache/                  FurfSky Reborn zips, vanilla textures, report.
+
+Data folder:
+  from source : the folder containing skyblock_tracker.py
+  from the exe: %APPDATA%\SkyBlockTracker  (an older save beside the exe is
+                copied over once, automatically)
+
+--------------------------------------------------------------------------
+ 2. ACCOUNT SYNC
+--------------------------------------------------------------------------
+2.1  Requests per sync (authenticated, API-Key header)
+       GET /v2/skyblock/profiles?uuid=<uuid>
+       GET /v2/skyblock/museum?profile=<profile_id>   (optional)
+     One unauthenticated Mojang name->UUID lookup the first time a username
+     is used (cached permanently; the key is never sent there).
+     The keyless /v2/resources/skyblock/items catalogue supplies names,
+     rarities and icon materials.
+
+2.2  Containers read
+     Inventory, worn armour, worn equipment, quiver, Ender Chest, backpacks
+     (all), personal vault, wardrobe, accessory bag, fishing bag, potion bag,
+     candy bag, carnival masks, sacks, museum donations. Unknown/new
+     NBT-bearing fields are decoded automatically; nested "bag_contents"
+     layouts are understood.
+
+2.3  COINS
+     Purse, co-op bank and personal bank come from the SAME profiles
+     response - zero extra requests. Three counted sources feed one
+     pseudo-item, COINS.
+       member.currencies.coin_purse            -> purse
+       profile.banking.balance                 -> bank (co-op)
+       member.currencies.personal_bank_balance -> personal bank (if present)
+     If none are returned the sync warns you; you can type a coin total
+     manually. Balances are a snapshot and do not update while the app is open.
+
+2.4  Island chests are NOT available
+     The public API does not expose chests on your private island. Use
+     "Manual Counts" or the Account Stock panel. Those counts persist and
+     behave exactly like a synced container. Negatives reserve items.
+
+2.5  Item identity
+     base64 -> gzip -> NBT via a dependency-free reader (all 13 tag types,
+     depth/size guards). Identity from tag.ExtraAttributes.id, which is the
+     SkyBlock item id recipes use. Pets -> PET_<TYPE>, runes -> RUNE_<NAME>.
+     Vanilla stacks without SkyBlock NBT use a legacy id/damage table.
+     Enchanted books count as ENCHANTED_BOOK, not per-enchantment.
+     Extra aliases: settings.id_aliases in the save file.
+
+2.6  The item map
+     Reduced to {container: {item_id: count}} then one {item_id: count} pool.
+     Only counts are cached - no raw NBT, no lore, no history.
+
+--------------------------------------------------------------------------
+ 3. COUNTING DEFAULTS
+--------------------------------------------------------------------------
+3.1  Presets (Settings > COUNTING DEFAULTS)
+     Crafting-safe (default)   the shipped default, below
+     Storage + inventory       storage/backpacks/vault/sacks/inventory only
+     Carried inventory only    just your inventory
+     Everything I own          every container INCLUDING museum donations
+     Custom                    appears when you tick a box
+     Buttons: Apply Preset, Restore Defaults.
+
+3.2  The "Crafting-safe" default
+     COUNTED     inventory, worn armour, worn equipment, quiver, Ender Chest,
+                 backpacks, personal vault, sacks, fishing bag, purse,
+                 co-op bank, personal bank, manual/island chests
+     NOT COUNTED wardrobe (spare sets), accessory bag (magical power),
+                 potion bag, candy bag, carnival masks, museum (donated items
+                 must be withdrawn before crafting)
+     Each is one checkbox with a live item/coin count. Coin sources and
+     manual counts are always counted.
+
+3.3  Presets never touch recipes, manual counts or prices - only which
+     containers feed the pool. Everything recomputes instantly.
+
+--------------------------------------------------------------------------
+ 4. COINS IN RECIPES
+--------------------------------------------------------------------------
+4.1  Open any recipe -> "＋ Add Coins". A locked Coins row appears; type
+     1500000, 1,500,000, 1.5m or 2b. You can also pick "Coins" from the item
+     picker. Coins can be added at ANY depth. They can never be a recipe
+     OUTPUT and never the goal (the app blocks both).
+
+4.2  COINS is a raw leaf in the same allocation engine as every item:
+       * required coins roll up with the usual multipliers
+       * holding an intermediate reduces the coin cost of its children
+       * purse + bank + personal bank + manual adjustment form the pool
+       * tree / resources / stock all show coin rows, compact in cells
+         (12.5M) and full in the side panel
+       * the ＋ button steps coins by 100,000 instead of 1
+     Coins are EXCLUDED from the unit-based "Materials covered" percentage
+     so 100M coins cannot drown out 5,000 Mithril. They get their own card.
+
+4.3  COIN, COINS and MONEY all normalise to COINS.
+
+--------------------------------------------------------------------------
+ 5. COIN COST TAB  (Ctrl+4)
+--------------------------------------------------------------------------
+5.1  Keyless GET /v2/skyblock/bazaar. No API key sent. Cached in
+     hypixel_bazaar.json; refreshed on a click (or Ctrl+P), or once per launch
+     when stale. Minimum interval floor 5 min, default 15, persisted
+     separately so clearing the price cache cannot bypass it. The auction
+     endpoint is deliberately NOT polled (paged and heavy).
+
+5.2  Price modes
+     Insta-buy   quick_status.buyPrice - pay now
+     Buy order   quick_status.sellPrice - estimate of what you must outbid
+     Order books (sell_summary / buy_summary) are the fallback when
+     quick_status is zero. Prices are indicative and move constantly.
+
+5.3  Scopes
+     Cost to finish (missing only)   what you still must buy and pay
+     Full value from scratch         ignores everything you own; a clean
+                                     recursive walk of the recipe graph
+
+5.4  Three groups
+     RAW ITEMS TO BUY   quantity short, unit price, subtotal, source
+     RAW COIN COSTS     every place a recipe demands coins, and how much of
+                        it your purse/bank already covers
+     CRAFTED ITEMS      unit value rolled up from ingredients. INFORMATIONAL
+                        and never added to the total (that would double count
+                        the raws). "≥" marks a value with unpriced descendants.
+
+5.5  Totals
+     Shopping cost + recipe coin costs = total coins needed, compared against
+     purse + bank + personal bank + manual -> "still short" / "fully funded".
+     Unpriced items are listed by name and the total is labelled a LOWER BOUND.
+
+5.6  Per-item controls (side panel, also on the tree's right-click)
+     Set Manual Price…      always wins over bazaar; accepts 1.25m etc.
+     Link Bazaar Product…   map an item to any bazaar product id
+     Clear Override / Link  back to automatic
+     All persist in the save file; wipe them in Settings.
+
+5.7  ID mismatches
+     An alias table handles known differences (MITHRIL -> MITHRIL_ORE,
+     TITANIUM -> TITANIUM_ORE, LAPIS_LAZULI -> INK_SACK:4, GUNPOWDER ->
+     SULPHUR, ...). Anything else shows "not on bazaar" until you link or
+     price it.
+
+--------------------------------------------------------------------------
+ 6. CACHING, TIMING AND POLICY COMPLIANCE
+--------------------------------------------------------------------------
+6.1  No background polling. Ever. A pull happens only on a click (Sync /
+     Ctrl+R, Refresh Prices / Ctrl+P) or once at launch if that cache is
+     stale. The policy bans continuous polling of player data and session
+     tracking, and asks for caching measured in hours or days.
+
+6.2  Persisted minimum intervals
+     Profiles: default 5 min, floor 5 min, selectable up to 6 hours.
+     Bazaar:   default 15 min, floor 5 min, selectable up to 1 hour.
+     Both timestamps are written BEFORE the request, so crashing or
+     restarting cannot pull faster. Clicking early shows the remaining time.
+
+6.3  Close time / start-up check
+     On close, last_closed = system time is written. At launch the app
+     compares now against last_closed AND the cache's fetched_at; if both are
+     older than the interval and the cooldown has expired, exactly one pull
+     happens. Fresh cache = zero requests.
+
+6.4  HTTP 429: RateLimit-Reset is honoured and turned into a cooldown.
+
+6.5  Key hygiene: never in source, the .bat, the exe, the save file, either
+     cache, a log or an error message. Masked in the UI. Sent only to
+     api.hypixel.net as a header. Read from HYPIXEL_API_KEY (priority) or the
+     local key file. Bazaar and the items catalogue never receive it.
+
+6.6  Also honoured: "not affiliated or endorsed" notice in the footer and
+     Settings; no gambling, monetisation, paywall or proxying; no tracking
+     beyond the single account you link; no stat history; no
+     de-anonymisation; no game-integrity impact. Register your own
+     application in the Hypixel Developer Portal before using authenticated
+     endpoints.
+
+--------------------------------------------------------------------------
+ 7. COUNTING METHODOLOGY
+--------------------------------------------------------------------------
+7.1  FROM HYPIXEL  one account-wide pool per item (and one for coins).
+     MANUAL        original behaviour: owned counts keyed by full tree path,
+                   credit cascading into ingredients at that position only.
+     Starts in Manual until the first successful sync, then switches to From
+     Hypixel. Manual progress is never overwritten by syncing.
+
+7.2  Allocation (From Hypixel), depth-first in tree order:
+         have      = min(required, remaining pool)
+         shortfall = required - have
+         children required = per-craft amount x shortfall
+     Two occurrences share one real pool (first in tree order wins); holding
+     an intermediate reduces its own ingredients; owning the goal marks the
+     whole tree "not needed".
+
+7.3  In From Hypixel mode every quantity box means "account stock for this
+     item" (or "coins available"). Typing a number writes a manual
+     adjustment, so you can record mining or spending without a request.
+     Mark Complete adds exactly the shortfall. Reset Progress clears
+     adjustments, never synced data.
+
+7.4  Safety: duplicate ingredient rows merged (unique paths); recipe cycles
+     skipped; depth capped at 24 and the tree at 12,000 nodes with an
+     on-screen warning naming the loop.
+
+--------------------------------------------------------------------------
+ 8. UI
+--------------------------------------------------------------------------
+8.1  Header: logo, title, live subtitle, account pill, status pill.
+8.2  Toolbar: Sync Hypixel (Ctrl+R) · Settings (Ctrl+,) · Add/Edit Recipe ·
+     Choose Goal · Manual Counts · Export · Reset Progress.
+8.3  FIVE stat cards: Goal · Materials covered (coins excluded) · Raw items
+     still needed · Coins to finish (have/short/unpriced) · Items in your
+     account (coins excluded from the item count).
+8.4  FOUR views (Ctrl+1..4):
+     RECIPE TREE      required/have/short/status/＋, rarity colours, stripes,
+                      full-width green completion that survives selection,
+                      interactive triangles, right-click menu. Coins are gold.
+     TOTAL RESOURCES  every item combined, expandable into "N x in <chain>";
+                      filter, Crafted/Raw/Hide-completed, expand/collapse.
+     ACCOUNT STOCK    the raw item map: in stock/needed/allocated/surplus/
+                      containers, expandable per container, searchable,
+                      "only items this goal needs", Use as Goal.
+     COIN COST        section 5.
+8.5  Consistent side panels with a per-item source breakdown.
+8.6  Settings: Account · API key · Sync behaviour · Counting defaults ·
+     Coin cost & bazaar prices · Local data · About.
+8.7  Expansion/selection/scroll survive rebuilds; 1-second footer clock (last
+     sync, next allowed sync, price age, mode); Export writes a costed
+     shopping list to .txt AND the clipboard; DPI scaling, dark title bar,
+     dark comboboxes; Escape or a blank-area click clears the selection.
+
+--------------------------------------------------------------------------
+ 9. RECIPES
+--------------------------------------------------------------------------
+Added BY HAND with the visual row editor (quantity + item picker, no syntax).
+Hypixel's items resource carries no recipe graph, so nothing about recipes is
+downloaded. The Titanium Drill DR-X355 chain ships as a starter database;
+saving an empty recipe intentionally deletes a starter recipe. The same
+editor is reused for manual counts, with a coins button in both.
+
+--------------------------------------------------------------------------
+10. KNOWN LIMITATIONS
+--------------------------------------------------------------------------
+* Island chests: not in the public API (use Manual Counts).
+* Purse/bank are a snapshot from the moment of the sync.
+* Personal bank is read best-effort; the field may not exist for all accounts.
+* Auction prices are not fetched; use a manual price for auction-only items.
+* "Buy order" pricing is an estimate derived from the insta-sell price.
+* Enchanted books counted as ENCHANTED_BOOK; pets as PET_<TYPE>.
+* Vanilla stacks without SkyBlock NBT use a best-effort legacy id table.
+* Museum items currently borrowed back are skipped to avoid double counting.
+* One linked account and one profile at a time.
+
+--------------------------------------------------------------------------
+11. CHANGELOG
+--------------------------------------------------------------------------
+3.1  Counting presets + Restore Defaults. Purse / co-op bank / personal bank
+     pulled into the item map as coin sources (no extra requests). COINS as a
+     first-class recipe ingredient with a ＋ Add Coins button and m/b/k
+     parsing. New Coin Cost tab: bazaar pricing, insta-buy vs buy-order,
+     cost-to-finish vs from-scratch, rolled-up craft values, manual prices,
+     manual bazaar links, unpriced lower-bound warnings. Fifth stat card.
+     Costed export. Coins excluded from unit progress and item totals.
+     Separate persisted bazaar cooldown. Gold coin styling and icon.
+3.0  Account sync (profiles + museum), NBT reader, item map, pool allocation
+     with intermediate-item credit, Account Stock view, manual/island-chest
+     layer, settings dialog with key management, persisted cooldown +
+     close/start-up staleness check, export, state-preserving rebuilds,
+     recipe dedupe, tree safety caps, disclaimer footer.
+2.0  Per-tree-position counters, cascading credit, Total Resources view,
+     FurfSky Reborn icons with CATS decoding, rarity row colours.
+1.0  Recursive recipe tree, visual recipe editor, dark theme, local saves.
+==========================================================================
