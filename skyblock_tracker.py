@@ -2240,11 +2240,10 @@ class SkyblockTracker(tk.Tk):
         if self._dirty.get(name):
             self._render_view(name)
         self.view_hint.set({
-            "tree": "Expand a branch to trace ingredients  •  green rows are covered  •  ＋ adds one  •  "
-                    "Coins behave like any other ingredient",
-            "resources": "Every item combined across all sub-recipes — expand a row to see where it is used",
-            "stock": "The item map pulled from your account — expand a row to see which container holds it",
-            "cost": "Bazaar prices for what you are missing, plus raw coin costs  •  Ctrl+P refreshes prices",
+            "tree": "Expand a branch to trace ingredients",
+            "resources": "Every item combined across all sub-recipes",
+            "stock": "The item map pulled from your account",
+            "cost": "Baazar prices - Ctrl+P refreshes prices",
         }[name])
 
     def _set_mode(self, mode):
@@ -2633,13 +2632,10 @@ class SkyblockTracker(tk.Tk):
         parts = ["Last sync " + hs.format_age(time.time() - fetched) if fetched else "Never synced"]
         remaining = self.sync.cooldown_remaining(interval)
         parts.append("next sync in " + hs.format_seconds(remaining) if remaining > 0 else "sync available")
-        age = self.market.age()
-        price_text = hs.format_age(time.time() - age) if age != float("inf") else "not loaded"
-        parts.append("prices " + price_text)
         if self.mode == "manual":
             parts.append("manual counting")
-        self.footer_var.set("   •   ".join(parts) + f"   •   {PLUS} adds one   •   right-click for options")
-        self.price_age_var.set(f"{comma(len(self.market.prices))} bazaar products  •  prices {price_text}")
+        self.footer_var.set("   •   ".join(parts) + f"   • right-click for options")
+        self.price_age_var.set(f"{comma(len(self.market.prices))} bazaar products")
         self.after(1000, self._tick)
 
     # ---------------- stock pool ----------------
